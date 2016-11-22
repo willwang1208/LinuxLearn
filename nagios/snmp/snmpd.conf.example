@@ -1,0 +1,112 @@
+# map the community name "public" into a "security name"
+#             sec.name          source          community
+#com2sec      notConfigUser      default           public
+com2sec      notConfigUser      10.173.38.200           public
+#com2sec        mynetwork       127.0.0.1         private
+# make mynetwork2 be accessed from 192.168.0.0~192.168.0.255 .the community is "public2"
+#com2sec        mynetwork2     192.168.0.0/24     public2
+#com2sec        mynetwork   nagios.agix.com.au    myweb
+
+# map the security name into a group name:
+#             groupName      securityModel      securityName
+group        notConfigGroup        v1           notConfigUser
+group        notConfigGroup        v2c          notConfigUser
+
+# create views to let the group have rights to "snmpwalk -v1 -c public localhost .1"
+#              name            incl/excl       subtree         [mask](optional)
+view        systemview         included          .1
+# .1 is the root of tree. contains all tree nodes.
+#view       systemview         included       .1.3.6.1.4.1.2021.2.1
+#view       systemview         included       .1.3.6.1.4.1.2021.10.1
+
+# grant the group read-only access to the systemview view.
+#              group       context    sec.model   sec.level   prefix    read        write      notif
+access     notConfigGroup     ""         any        noauth     exact  systemview     none      none
+
+# add all disks to monitor. they can be found under .1.3.6.1.4.1.2021.9.1
+includeAllDisks 10%
+
+#disk /
+#disk /alidata1 80%
+
+# Keep 100 MB free for /alidata2
+#disk /alidata2 100000
+
+# add process to monitor. they can be found under .1.3.6.1.4.1.2021.2.1
+proc    mongod
+proc    mongos
+proc    java
+proc    nginx
+proc    mysqld
+proc    postgres
+
+# set process sshd min 1 max 10
+#proc    sshd    10    1
+
+#proc       httpd
+#procfix    httpd  systemctl restart httpd
+
+# MIB-Specific extension commands. to make your information available.
+#pass    .1.3.6.1.4.1.4413.4.1    /usr/bin/ucd5820stat
+
+# specify a super user be provided access to the full OID tree. the user will be allowed read-only or read-write 
+# rouser/rwuser (for SNMPv3) or rocommunity/rwcommunity (for SNMPv1 or SNMPv2c)
+#rouser         supermfp
+#rwuser         supermfp2
+#rocommunity    supermfp
+#rwcommunity    supermfp2
+
+
+# some system contact information
+#syslocation        Unknown (edit /etc/snmp/snmpd.conf)
+#syscontact         Root <root@localhost> (configure /etc/snmp/snmp.local.conf)
+
+# some logging settings
+dontLogTCPWrappersConnects    yes
+
+
+
+##### set proxy for another snmpd. #####
+# map the community name "ctx_m108" into a "security name"
+#         [-Cn context]        sec.name          source            community
+com2sec    -Cn ctx_hs_1       notConfigUser      10.173.38.200      ctx_hs_1
+com2sec    -Cn ctx_hs_2       notConfigUser      10.173.38.200      ctx_hs_2
+com2sec    -Cn ctx_hs_3       notConfigUser      10.173.38.200      ctx_hs_3
+com2sec    -Cn ctx_hs_4       notConfigUser      10.173.38.200      ctx_hs_4
+com2sec    -Cn ctx_hs_5       notConfigUser      10.173.38.200      ctx_hs_5
+com2sec    -Cn ctx_hs_6       notConfigUser      10.173.38.200      ctx_hs_6
+com2sec    -Cn ctx_hs_7       notConfigUser      10.173.38.200      ctx_hs_7
+com2sec    -Cn ctx_hs_8       notConfigUser      10.173.38.200      ctx_hs_8
+com2sec    -Cn ctx_hs_9       notConfigUser      10.173.38.200      ctx_hs_9
+com2sec    -Cn ctx_hm         notConfigUser      10.173.38.200      ctx_hm
+
+# grant the group read-only access to the systemview view with context name "ctx_m108".
+#              group            context   sec.model   sec.level   prefix      read        write    notif
+access      notConfigGroup     ctx_hs_1     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_2     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_3     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_4     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_5     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_6     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_7     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_8     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hs_9     any       noauth     prefix    systemview     none     none
+access      notConfigGroup     ctx_hm       any       noauth     prefix    systemview     none     none
+
+# define proxy with context name "ctx_m108" for 10.174.8.228 host. 
+# the oid .1.3 should be in views. and host 10.174.8.228 should be accessed from current host.
+#        [-Cn contextname] [snmpcmd_args]         host           oid         [remoteoid]
+proxy     -Cn ctx_hs_1     -v 2c -c ctx_hs_1      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_2     -v 2c -c ctx_hs_2      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_3     -v 2c -c ctx_hs_3      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_4     -v 2c -c ctx_hs_4      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_5     -v 2c -c ctx_hs_5      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_6     -v 2c -c ctx_hs_6      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_7     -v 2c -c ctx_hs_7      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_8     -v 2c -c ctx_hs_8      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hs_9     -v 2c -c ctx_hs_9      175.xx.xx.xx       .1.3
+proxy     -Cn ctx_hm       -v 2c -c public        175.xx.xx.xx       .1.3
+
+
+
+
