@@ -5,13 +5,13 @@
 PGXL_USER=postgres
 PGXL_DATA_HOME=/mfpdata/pgxl_data
 PGXL_LOG_HOME=/mfplog/pgxl_log
-GTM_DIR_NAME=gtmt
-GTM_PROXY_DIR_NAME=gtm_pxyt
-COORDINATOR_DIR_NAME=coordt
-DATANODE_DIR_NAME=dnt
+GTM_DIR_NAME=gtm
+GTM_PROXY_DIR_NAME=gtm_pxy
+COORDINATOR_DIR_NAME=coord
+DATANODE_DIR_NAME=dn
 
 # control
-CTL_HOME=.
+CTL_HOME=$(dirname $(readlink -f $0))
 CTL_LOG_DIR=$CTL_HOME/log
 CTL_ETC_DIR=$CTL_HOME/etc
 CTL_RUN_DIR=$CTL_HOME/run
@@ -181,15 +181,17 @@ get_process_status(){
     local port=$2
     local special=$3
     if [ "$host" != "" ] && [ "$port" != "" ]; then
+        #local resp=`echo -e "\n" | timeout 1 telnet $host 22 2>/dev/null | grep Connected`
         local resp
-        local resp=`echo -e "\n" | timeout 1 telnet $host 22 2>/dev/null | grep Connected`
+        ping -c 1 -w 1 $host &>/dev/null && resp="Connected" || resp=""
         if [ "$resp" == "" ]; then
             VARS=$STATUS_HOSTDOWN
         else
             if [ "$special" == "gtm" ]; then
-                resp=`timeout 3 ssh $PGXL_USER@$host "pidof gtm"`
+                resp=`ssh $PGXL_USER@$host "pidof gtm"`
             elif [ "$special" == "gtm_proxy" ]; then
-                resp=`timeout 3 ssh $PGXL_USER@$host "pidof gtm_proxy"`
+                #resp=`ssh $PGXL_USER@$host "pidof gtm_proxy"`
+                resp=`ssh $PGXL_USER@$host "ps aux |grep \"gtm_proxy -D $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME\" | grep -v \"grep\""`
             else
                 resp=`echo -e "\n" | timeout 1 telnet $host $port 2>/dev/null | grep Connected`
             fi
@@ -202,6 +204,43 @@ get_process_status(){
     else
         VARS=$STATUS_ERROR
     fi
+}
+
+get_process_status2(){
+    local mode=$1
+    local name=$2
+    local role=$3
+    local host
+    local port
+    local special
+    if [ "$mode" == "gtm" ]; then 
+        port=20001
+        special=gtm
+        if [ "$role" == "master" ]; then 
+            host=$RT_GTM_MASTER_HOST
+        elif [ "$role" == "slave" ]; then 
+            host=$RT_GTM_SLAVE_HOST
+        fi
+    elif [ "$mode" == "gtm_proxy" ]; then 
+        port=20002
+        special=gtm_proxy
+        find_host_by_name $name "${RT_GTM_PROXY_NAMES[*]}" "${RT_GTM_PROXY_HOSTS[*]}"
+        host=$VARS
+    elif [ "$mode" == "coordinator" ]; then 
+        port=21001
+        find_host_by_name $name "${RT_COORDINATOR_NAMES[*]}" "${RT_COORDINATOR_HOSTS[*]}"
+        host=$VARS
+    elif [ "$mode" == "datanode" ]; then 
+        port=23001
+        if [ "$role" == "master" ]; then 
+            find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_MASTER_HOSTS[*]}"
+            host=$VARS
+        elif [ "$role" == "slave" ]; then 
+            find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_SLAVE_HOSTS[*]}"
+            host=$VARS
+        fi
+    fi
+    get_process_status $host $port $special
 }
 
 get_process_status_info(){
@@ -247,10 +286,11 @@ edit_runtime_config(){
     local line=`grep "^${pattern}" $CTL_RUN_DIR/$RUNTIME_CONFIG`
     if [ "$line" == "" ] && [ "$value" != "" ]; then
         echo "$param=$value" >> $CTL_RUN_DIR/$RUNTIME_CONFIG;
-    elif [ "$value" != "" ]; then
-        sed -i "s|^$pattern.*|$pattern=$value|g" $CTL_RUN_DIR/$RUNTIME_CONFIG;
+    #elif [ "$value" != "" ]; then
     else
-        sed -i "/^$pattern.*/d" $CTL_RUN_DIR/$RUNTIME_CONFIG;
+        sed -i "s|^$pattern.*|$pattern=$value|g" $CTL_RUN_DIR/$RUNTIME_CONFIG;
+    #else
+    #    sed -i "/^$pattern.*/d" $CTL_RUN_DIR/$RUNTIME_CONFIG;
     fi
     eval "$param=$value"
     log "Edit runtime config : $param=$value"
@@ -316,7 +356,7 @@ do_init_operate(){
             init_gtm_master "$GTM_MASTER_HOST" "$l_con"
         fi
         if [ "$l_role" == "slave" ] || [ "$l_role" == "" ]; then 
-            init_gtm_slave "$GTM_SLAVE_HOST" "$l_con"
+            init_gtm_slave "$GTM_MASTER_HOST" "$GTM_SLAVE_HOST" "$l_con"
         fi
     elif [ "$l_mode" == "gtm_proxy" ]; then 
         if [ "$l_name" == "" ]; then 
@@ -324,7 +364,7 @@ do_init_operate(){
             local i
             for (( i=0; i<$length; i++ ))
             do
-                init_gtm_proxy ${GTM_PROXY_NAMES[$i]} ${GTM_PROXY_HOSTS[$i]} $i "$l_con"
+                init_gtm_proxy ${GTM_PROXY_NAMES[$i]} ${GTM_PROXY_HOSTS[$i]} $i "$GTM_MASTER_HOST" "$l_con"
             done
         else
             find_host_by_name $l_name "${GTM_PROXY_NAMES[*]}" "${GTM_PROXY_HOSTS[*]}"
@@ -332,7 +372,7 @@ do_init_operate(){
             if [ "$host" != "" ]; then 
                 find_index_by_name $l_name "${GTM_PROXY_NAMES[*]}"
                 local index=$VARS
-                init_gtm_proxy $l_name $host $index "$l_con"
+                init_gtm_proxy $l_name $host $index "$GTM_MASTER_HOST" "$l_con"
             fi
         fi
     elif [ "$l_mode" == "coordinator" ]; then 
@@ -424,37 +464,39 @@ init_gtm_master_config(){
 }
 
 init_gtm_slave(){
-    local host=$1
-    local condition=$2
+    local master=$1
+    local slave=$2
+    local condition=$3
     log ">>>>>> Init gtm slave. $condition"
     if [ "$condition" == "config" ]; then
-        init_gtm_slave_config $host
+        init_gtm_slave_config $master $slave
     else
-        prepare_before_init $host $GTM_DIR_NAME $condition
-        is_remote_dir_exists $host $PGXL_DATA_HOME/$GTM_DIR_NAME
+        prepare_before_init $slave $GTM_DIR_NAME $condition
+        is_remote_dir_exists $slave $PGXL_DATA_HOME/$GTM_DIR_NAME
         local resp=$VARS
         if [[ $resp -eq $TRUE ]]; then
             log "WARNING: Init skip. Gtm slave exists"
         elif [[ $resp -eq $FALSE ]]; then
-            local rs=`ssh $PGXL_USER@$host "initgtm -Z gtm -D $PGXL_DATA_HOME/$GTM_DIR_NAME"`
+            local rs=`ssh $PGXL_USER@$slave "initgtm -Z gtm -D $PGXL_DATA_HOME/$GTM_DIR_NAME"`
             log "$rs"
-            init_gtm_slave_config $host
-            edit_runtime_config "RT_GTM_SLAVE_HOST" "$host"
+            init_gtm_slave_config $master $slave
+            edit_runtime_config "RT_GTM_SLAVE_HOST" "$slave"
             log "Init gtm slave done"
         fi
     fi
 }
 
 init_gtm_slave_config(){
-    local host=$1
-    scp $CTL_ETC_DIR/$TEMPLATE_GTM_SLAVE $PGXL_USER@$host:$PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf 1>/dev/null
-    ssh $PGXL_USER@$host "
+    local master=$1
+    local slave=$2
+    scp $CTL_ETC_DIR/$TEMPLATE_GTM_SLAVE $PGXL_USER@$slave:$PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf 1>/dev/null
+    ssh $PGXL_USER@$slave "
         mkdir -p $PGXL_LOG_HOME/$GTM_DIR_NAME;
-        sed -i \"s/^active_host.*/active_host = \'$GTM_MASTER_HOST\'/g\" $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf;
+        sed -i \"s/^active_host.*/active_host = \'$master\'/g\" $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf;
         sed -i \"s|^log_file.*|log_file = \'$PGXL_LOG_HOME/$GTM_DIR_NAME/gtm.log\'|g\" $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf;
         rm -f $PGXL_DATA_HOME/$GTM_DIR_NAME/pgxl.master;
     "
-    local rs=`ssh $PGXL_USER@$host "cat $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf"`
+    local rs=`ssh $PGXL_USER@$slave "cat $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf"`
     log "Gtm slave config: \n$rs"
 }
 
@@ -462,10 +504,11 @@ init_gtm_proxy(){
     local name=$1
     local host=$2
     local index=$3
-    local condition=$4
+    local master=$4
+    local condition=$5
     log ">>>>>> Init gtm proxy. $name $host $condition"
     if [ "$condition" == "config" ]; then
-        init_gtm_proxy_config $name $host
+        init_gtm_proxy_config $name $host $master
     else
         prepare_before_init $host $GTM_PROXY_DIR_NAME $condition
         is_remote_dir_exists $host $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME
@@ -475,7 +518,7 @@ init_gtm_proxy(){
         elif [[ $resp -eq $FALSE ]]; then
             local rs=`ssh $PGXL_USER@$host "initgtm -Z gtm_proxy -D $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME"`
             log "$rs"
-            init_gtm_proxy_config $name $host
+            init_gtm_proxy_config $name $host $master
             edit_runtime_config "RT_GTM_PROXY_NAMES" "$name" $index
             edit_runtime_config "RT_GTM_PROXY_HOSTS" "$host" $index
             log "Init gtm proxy $name $host done"
@@ -486,11 +529,12 @@ init_gtm_proxy(){
 init_gtm_proxy_config(){
     local name=$1
     local host=$2
+    local master=$3
     scp $CTL_ETC_DIR/$TEMPLATE_GTM_PROXY $PGXL_USER@$host:$PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf 1>/dev/null
     ssh $PGXL_USER@$host "
         mkdir -p $PGXL_LOG_HOME/$GTM_PROXY_DIR_NAME;
         sed -i \"s/^nodename.*/nodename = \'$name\'/g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
-        sed -i \"s/^gtm_host.*/gtm_host = \'$GTM_MASTER_HOST\'/g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
+        sed -i \"s/^gtm_host.*/gtm_host = \'$master\'/g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
         sed -i \"s|^log_file.*|log_file = \'$PGXL_LOG_HOME/$GTM_PROXY_DIR_NAME/gtm_pxy.log\'|g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
     "
     local rs=`ssh $PGXL_USER@$host "cat $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf"`
@@ -575,6 +619,8 @@ init_datanode_master_config(){
         sed -i \"s/^pgxc_node_name.*/pgxc_node_name = \'$name\'/g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         sed -i \"s|^log_directory.*|log_directory = \'$PGXL_LOG_HOME/$DATANODE_DIR_NAME\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         sed -i \"s|^archive_command.*|archive_command = \'rsync %p $PGXL_USER@$slave:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_alog/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
+        rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf
+        rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/backup_label.old
         touch $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pgxl.master
     "
     local rs=`ssh $PGXL_USER@$master "cat $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf"`
@@ -918,6 +964,8 @@ op_gtm(){
                 ssh $PGXL_USER@$host "kill -9 $pid > /tmp/$op_$name.oplog 2>&1 &"
             fi
         elif [ "$op" == "stop" ] || [ "$op" == "restart" ]; then 
+            local rs=`ssh $PGXL_USER@$host "cat $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.control"`
+            log "$rs"
             ssh $PGXL_USER@$host "gtm_ctl $op -Z gtm -D $PGXL_DATA_HOME/$GTM_DIR_NAME -m fast > /tmp/$op_$name.oplog 2>&1 &"
         else
             ssh $PGXL_USER@$host "gtm_ctl $op -Z gtm -D $PGXL_DATA_HOME/$GTM_DIR_NAME > /tmp/$op_$name.oplog 2>&1 &"
@@ -1006,36 +1054,66 @@ op_write_log(){
     fi
 }
 
+do_runtime_stop_or_kill(){
+    local mode=$1
+    local name=$2
+    local role=$3
+    local times=$4
+    while [[ $times > 0 ]]
+    do
+        get_process_status2 "$mode" "$name" "$role"
+        local status=$VARS
+        if [[ $status -eq $STATUS_RUNNING ]]; then
+            do_runtime_operate stop "$mode" "$name" "$role"
+        fi
+        times=`expr $times - 1`
+    done
+    do_runtime_operate kill "$mode" "$name" "$role"
+}
+
 failover_gtm(){
     if [ "$RT_GTM_SLAVE_HOST" == "" ]; then 
         log "ERROR: Cannot fail over gtm. Not found slave"
     else
         log ">>>>>> Fail over gtm to $RT_GTM_SLAVE_HOST"
-        #do_runtime_operate promote gtm gtm slave
-        local rs=`ssh $PGXL_USER@$RT_GTM_SLAVE_HOST "gtm_ctl promote -Z gtm -D $PGXL_DATA_HOME/$GTM_DIR_NAME"`
-        log "$rs"
-        scp $CTL_ETC_DIR/$TEMPLATE_GTM_MASTER $PGXL_USER@$RT_GTM_SLAVE_HOST:$PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf 1>/dev/null
-        ssh $PGXL_USER@$RT_GTM_SLAVE_HOST "
-            sed -i \"s|^log_file.*|log_file = \'$PGXL_LOG_HOME/$GTM_DIR_NAME/gtm.log\'|g\" $PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.conf;
-            touch $PGXL_DATA_HOME/$GTM_DIR_NAME/pgxl.master
-        "
+        init_gtm_master_config $RT_GTM_SLAVE_HOST
         local tmp_host=$RT_GTM_MASTER_HOST
         edit_runtime_config "RT_GTM_MASTER_HOST" "$RT_GTM_SLAVE_HOST"
         edit_runtime_config "RT_GTM_SLAVE_HOST" "$tmp_host"
-        do_runtime_operate stop gtm gtm master
-        do_runtime_operate kill gtm gtm master
-        do_runtime_operate start gtm gtm master
         local length=${#RT_GTM_PROXY_NAMES[@]}
         local i
         for (( i=0; i<$length; i++ ))
         do
-            ssh $PGXL_USER@${RT_GTM_PROXY_HOSTS[$i]} "
-                sed -i \"s|^gtm_host.*|gtm_host = \'$RT_GTM_MASTER_HOST\'|g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
-            "
+            local gtmpxy_host=${RT_GTM_PROXY_HOSTS[$i]}
+            get_process_status $gtmpxy_host 20002 gtm_proxy
+            local s_host=$VARS
+            if [[ $s_host -eq $STATUS_RUNNING ]]; then
+                ssh $PGXL_USER@$gtmpxy_host "
+                    sed -i \"s|^gtm_host.*|gtm_host = \'$RT_GTM_MASTER_HOST\'|g\" $PGXL_DATA_HOME/$GTM_PROXY_DIR_NAME/gtm_proxy.conf;
+                "
+            fi
         done
-        do_runtime_operate stop gtm_proxy
+        do_runtime_operate kill coordinator
+        do_runtime_operate stop datanode
+        do_runtime_operate kill datanode
         do_runtime_operate kill gtm_proxy
+        do_runtime_operate kill gtm
+        ssh $PGXL_USER@$RT_GTM_MASTER_HOST "
+            rm -f $PGXL_DATA_HOME/$GTM_DIR_NAME/register.node;
+        "
+        get_process_status $RT_GTM_SLAVE_HOST 20001 gtm
+        local status=$VARS
+        if [[ $status -eq $STATUS_RUNNING ]] || [[ $status -eq $STATUS_STOPPED ]]; then
+            ssh $PGXL_USER@$RT_GTM_MASTER_HOST "
+                scp $PGXL_USER@$RT_GTM_SLAVE_HOST:$PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.control $PGXL_DATA_HOME/$GTM_DIR_NAME/ 1>/dev/null
+            "
+        else
+            log "WARNING: Cannot sync gtm.control to new gtm master."
+        fi
+        do_runtime_operate start gtm
         do_runtime_operate start gtm_proxy
+        do_runtime_operate start datanode
+        do_runtime_operate start coordinator
         log "Fail over gtm done"
     fi
 }
@@ -1056,17 +1134,9 @@ failover_datanode(){
             get_process_status $new_slave 23001
             local status=$VARS
             if [[ $status -eq $STATUS_RUNNING ]]; then
-                do_runtime_operate kill datanode $l_name master
+                do_runtime_stop_or_kill datanode $l_name master 3
             fi
-            scp $CTL_ETC_DIR/$TEMPLATE_DN_MASTER $PGXL_USER@$new_master:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf 1>/dev/null
-            ssh $PGXL_USER@$new_master "
-                sed -i \"s/^pgxc_node_name.*/pgxc_node_name = \'$l_name\'/g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
-                sed -i \"s|^log_directory.*|log_directory = \'$PGXL_LOG_HOME/$DATANODE_DIR_NAME\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
-                sed -i \"s|^archive_command.*|archive_command = \'rsync %p $PGXL_USER@$new_slave:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_alog/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
-                rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf
-                rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/backup_label.old
-                touch $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pgxl.master
-            "
+            init_datanode_master_config $l_name $new_master $new_slave
             local length=${#RT_DATANODE_NAMES[@]}
             local i
             for (( i=0; i<$length; i++ ))
@@ -1077,22 +1147,21 @@ failover_datanode(){
                     edit_runtime_config "RT_DATANODE_SLAVE_HOSTS" "$new_slave" $i
                 fi
             done
-            do_runtime_operate stop datanode $l_name master
-            do_runtime_operate kill datanode $l_name master
-            do_runtime_operate start datanode $l_name master
-            prepare_register_sql
-            execute_register_sql
             do_runtime_operate kill coordinator
             do_runtime_operate stop datanode
             do_runtime_operate kill datanode
             do_runtime_operate kill gtm_proxy
-            do_runtime_operate kill gtm gtm master
+            do_runtime_stop_or_kill gtm gtm master 3
             ssh $PGXL_USER@$RT_GTM_MASTER_HOST "
                 rm -f $PGXL_DATA_HOME/$GTM_DIR_NAME/register.node;
             "
             do_runtime_operate start gtm gtm master
             do_runtime_operate start gtm_proxy
             do_runtime_operate start datanode
+            do_runtime_operate start coordinator
+            prepare_register_sql
+            execute_register_sql
+            do_runtime_operate kill coordinator
             do_runtime_operate start coordinator
             log "Fail over datanode $l_name done"
         fi
@@ -1106,7 +1175,7 @@ rebuild_gtm_slave(){
         local status=$VARS
         if [[ $status -eq $STATUS_STOPPED ]]; then
             log ">>>>>> Rebuild gtm slave $RT_GTM_SLAVE_HOST $condition"
-            init_gtm_slave "$RT_GTM_SLAVE_HOST" "$condition"
+            init_gtm_slave "$RT_GTM_MASTER_HOST" "$RT_GTM_SLAVE_HOST" "$condition"
             log "Rebuild gtm slave $RT_GTM_SLAVE_HOST done"
         else
             log "ERROR: Cannot rebuild gtm slave. Node is not stopped"
@@ -1131,7 +1200,7 @@ rebuild_gtm_proxy(){
                 log ">>>>>> Rebuild gtm proxy $name $condition"
                 find_index_by_name $name "${RT_GTM_PROXY_NAMES[*]}"
                 local index=$VARS
-                init_gtm_proxy $name $host $index "$condition"
+                init_gtm_proxy $name $host $index "$RT_GTM_MASTER_HOST" "$condition"
                 log "Rebuild gtm proxy $name done"
             else
                 log "ERROR: Cannot rebuild gtm proxy ${name}. Node is not stopped"
@@ -1195,9 +1264,11 @@ add_coordinator(){
     if [ "$name" == "" ]; then 
         log "ERROR: Cannot add coordinator. Name is null"
     else
-        find_index_by_name $name "${RT_COORDINATOR_NAMES[*]}"
-        local index=$VARS
-        if [ "$index" == "" ]; then 
+        find_host_by_name $name "${RT_COORDINATOR_NAMES[*]}" "${RT_COORDINATOR_HOSTS[*]}"
+        local host=$VARS
+        get_process_status $host 21001
+        local status=$VARS
+        if [[ $status -ne $STATUS_RUNNING ]]; then 
             log ">>>>>> Add coordinator $name $condition"
             do_init_operate coordinator "$name" "" "$condition"
             find_host_by_name $name "${RT_COORDINATOR_NAMES[*]}" "${RT_COORDINATOR_HOSTS[*]}"
@@ -1205,22 +1276,28 @@ add_coordinator(){
             find_alive_host "${RT_COORDINATOR_HOSTS[*]}" 21001 $host
             local primary=$VARS
             if [ "$host" != "" ] && [ "$primary" != "" ]; then 
-                ssh $PGXL_USER@$host "
-                    pg_dumpall -p 21001 -h $primary -s --include-nodes --dump-nodes --file=$PGXL_DATA_HOME/$COORDINATOR_DIR_NAME/primary.sql;
-                    pg_ctl start -Z restoremode -D $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME -o -i > /tmp/restore_$name.oplog 2>&1 &
-                    sleep 1s;
-                    psql -p 21001 -f $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME/primary.sql;
-                    pg_ctl stop -Z restoremode -D $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME;
-                "
-                do_runtime_operate start coordinator "$name"
-                prepare_register_sql
-                execute_register_sql
-                log "Add coordinator $name done"
+                get_process_status $host 21001
+                local status=$VARS
+                if [[ $status -eq $STATUS_STOPPED ]]; then 
+                    ssh $PGXL_USER@$host "
+                        pg_dumpall -p 21001 -h $primary -s --include-nodes --dump-nodes --file=$PGXL_DATA_HOME/$COORDINATOR_DIR_NAME/primary.sql;
+                        pg_ctl start -Z restoremode -D $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME -o -i > /tmp/restore_$name.oplog 2>&1 &
+                        sleep 1s;
+                        psql -p 21001 -f $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME/primary.sql;
+                        pg_ctl stop -Z restoremode -D $PGXL_DATA_HOME/$COORDINATOR_DIR_NAME;
+                    "
+                    do_runtime_operate start coordinator "$name"
+                    prepare_register_sql
+                    execute_register_sql
+                    log "Add coordinator $name done"
+                else
+                    log "ERROR: Cannot add coordinator ${name}. Host($host) is $status"
+                fi
             else
                 log "ERROR: Cannot add coordinator ${name}. Host($host) or primary host($primary) is null"
             fi
         else
-            log "WARNING: Cannot add coordinator $name. Already exists"
+            log "WARNING: Cannot add coordinator $name. Already exists and running"
         fi
     fi
 }
@@ -1241,22 +1318,28 @@ add_datanode(){
             find_alive_host "${RT_DATANODE_MASTER_HOSTS[*]}" 23001 $host
             local primary=$VARS
             if [ "$host" != "" ] && [ "$primary" != "" ]; then 
-                ssh $PGXL_USER@$host "
-                    pg_dumpall -p 23001 -h $primary -s --include-nodes --dump-nodes --file=$PGXL_DATA_HOME/$DATANODE_DIR_NAME/primary.sql;
-                    pg_ctl start -Z restoremode -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME -o -i > /tmp/restore_$name.oplog 2>&1 &
-                    sleep 1s;
-                    psql -p 23001 -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/primary.sql;
-                    pg_ctl stop -Z restoremode -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME;
-                "
-                do_runtime_operate start datanode "$name" "master"
+                get_process_status $host 23001
+                local status=$VARS
+                if [[ $status -eq $STATUS_STOPPED ]]; then 
+                    ssh $PGXL_USER@$host "
+                        pg_dumpall -p 23001 -h $primary -s --include-nodes --dump-nodes --file=$PGXL_DATA_HOME/$DATANODE_DIR_NAME/primary.sql;
+                        pg_ctl start -Z restoremode -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME -o -i > /tmp/restore_$name.oplog 2>&1 &
+                        sleep 1s;
+                        psql -p 23001 -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/primary.sql;
+                        pg_ctl stop -Z restoremode -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME;
+                    "
+                    do_runtime_operate start datanode "$name" "master"
+                    do_init_operate datanode "$name" "slave" "$condition"
+                    do_runtime_operate start datanode "$name" "slave"      # need to start master and slave before register nodes if synchronous_standby_names is not empty
+                    prepare_register_sql
+                    execute_register_sql
+                    log "Add datanode $name done"
+                else
+                    log "ERROR: Cannot add datanode master ${name}. Host($host) is $status"
+                fi
             else
                 log "ERROR: Cannot add datanode master ${name}. Host($host) or primary host($primary) is null"
             fi
-            do_init_operate datanode "$name" "slave" "$condition"
-            do_runtime_operate start datanode "$name" "slave"      # need to start master and slave before register nodes if synchronous_standby_names is not empty
-            prepare_register_sql
-            execute_register_sql
-            log "Add datanode $name done"
         else
             log "WARNING: Cannot add datanode $name. Already exists"
         fi
@@ -1271,15 +1354,19 @@ remove_gtm_proxy(){
     else
         find_index_by_name $name "${RT_GTM_PROXY_NAMES[*]}"
         local index=$VARS
-        if [ "$index" != "" ]; then 
+        local length=${#RT_GTM_PROXY_NAMES[@]}
+        local length_end=`expr $length - 1`
+        if [ "$index" == "" ]; then 
+            log "WARNING: Cannot remove gtm proxy $name. Not found"
+        elif [[ $index -ne $length_end ]]; then 
+            log "WARNING: Cannot remove gtm proxy $name. Not the last one $index $length"
+        else
             log ">>>>>> Remove gtm proxy $name $condition"
             do_runtime_operate stop gtm_proxy $name
             do_runtime_operate kill gtm_proxy $name
             edit_runtime_config "RT_GTM_PROXY_NAMES" "" $index
             edit_runtime_config "RT_GTM_PROXY_HOSTS" "" $index
             log "Remove gtm proxy $name done"
-        else
-            log "WARNING: Cannot remove gtm proxy $name. Not found"
         fi
     fi
 }
@@ -1291,7 +1378,13 @@ remove_coordinator(){
     else
         find_index_by_name $name "${RT_COORDINATOR_NAMES[*]}"
         local index=$VARS
-        if [ "$index" != "" ]; then 
+        local length=${#RT_COORDINATOR_NAMES[@]}
+        local length_end=`expr $length - 1`
+        if [ "$index" == "" ]; then 
+            log "WARNING: Cannot remove coordinator $name. Not found"
+        elif [[ $index -ne $length_end ]]; then 
+            log "WARNING: Cannot remove coordinator $name. Not the last one $index $length"
+        else
             log ">>>>>> Remove coordinator $name"
             do_runtime_operate stop coordinator $name
             do_runtime_operate kill coordinator $name
@@ -1300,8 +1393,6 @@ remove_coordinator(){
             edit_runtime_config "RT_COORDINATOR_NAMES" "" $index
             edit_runtime_config "RT_COORDINATOR_HOSTS" "" $index
             log "Remove coordinator $name done"
-        else
-            log "WARNING: Cannot remove coordinator $name. Not found"
         fi
     fi
 }
@@ -1313,7 +1404,13 @@ remove_datanode(){
     else
         find_index_by_name $name "${RT_DATANODE_NAMES[*]}"
         local index=$VARS
+        local length=${#RT_DATANODE_NAMES[@]}
+        local length_end=`expr $length - 1`
         if [ "$index" != "" ]; then 
+            log "WARNING: Cannot remove datanode $name. Not found"
+        elif [[ $index -ne $length_end ]]; then 
+            log "WARNING: Cannot remove datanode $name. Not the last one $index $length"
+        else
             find_alive_host "${RT_COORDINATOR_HOSTS[*]}" 21001
             local primary=$VARS
             is_datanode_ready_to_be_removed $name $primary
@@ -1331,8 +1428,6 @@ remove_datanode(){
             else
                 log "ERROR: Cannot remove datanode $name. Please re-balance data first."
             fi
-        else
-            log "WARNING: Cannot remove datanode $name. Not found"
         fi
     fi
 }
@@ -1352,6 +1447,37 @@ rebalance_datanode(){
         else
             log "ERROR: Cannot rebalance datanode. Primary host($primary) is null"
         fi
+    fi
+}
+
+clean_coordinator_log(){
+    local days=$1
+    if [ "$days" != "" ]; then 
+        log ">>>>>> Execute clean coordinator log $days"
+        local length=${#RT_COORDINATOR_HOSTS[@]}
+        local i
+        for (( i=0; i<$length; i++ ))
+        do
+            local host=${RT_COORDINATOR_HOSTS[$i]}
+            ssh $PGXL_USER@$host "find $PGXL_LOG_HOME/$COORDINATOR_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
+        done
+    fi
+}
+
+clean_datanode_log(){
+    local days=$1
+    if [ "$days" != "" ]; then 
+        log ">>>>>> Execute clean datanode log $days"
+        local length=${#RT_DATANODE_NAMES[@]}
+        local i
+        for (( i=0; i<$length; i++ ))
+        do
+            local name=${RT_DATANODE_NAMES[$i]}
+            local master=${RT_DATANODE_MASTER_HOSTS[$i]}
+            local slave=${RT_DATANODE_SLAVE_HOSTS[$i]}
+            ssh $PGXL_USER@$master "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
+            ssh $PGXL_USER@$slave "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
+        done
     fi
 }
 
@@ -1377,9 +1503,11 @@ start_keeper(){
             local s_master=$VARS
             if [[ $s_master -ne $STATUS_RUNNING ]] && [[ $s_slave -eq $STATUS_RUNNING ]]; then
                 failover_gtm
+                continue
             fi
         elif [[ $s_master -eq $STATUS_HOSTDOWN ]] && [[ $s_slave -eq $STATUS_RUNNING ]]; then
             failover_gtm
+            continue
         fi
         if [[ $s_slave -eq $STATUS_STOPPED ]]; then
             is_remote_file_exists $RT_GTM_SLAVE_HOST $PGXL_DATA_HOME/$GTM_DIR_NAME/pgxl.master
@@ -1394,6 +1522,10 @@ start_keeper(){
                 rebuild_gtm_slave clean
                 do_runtime_operate start gtm gtm slave
             fi
+        elif [[ $s_slave -eq $STATUS_RUNNING ]]; then
+            ssh $PGXL_USER@$RT_GTM_SLAVE_HOST "
+                scp $PGXL_USER@$RT_GTM_MASTER_HOST:$PGXL_DATA_HOME/$GTM_DIR_NAME/gtm.control $PGXL_DATA_HOME/$GTM_DIR_NAME/ 1>/dev/null
+            "
         fi
         
         # gtm proxy
@@ -1406,13 +1538,13 @@ start_keeper(){
             get_process_status $host 20002 gtm_proxy
             local s_host=$VARS
             if [[ $s_host -eq $STATUS_STOPPED ]]; then
-                do_runtime_operate start gtm_proxy $name
-                get_process_status $host 20002 gtm_proxy
-                s_host=$VARS
-                if [[ $s_host -ne $STATUS_RUNNING ]]; then
-                    rebuild_gtm_proxy "$name" clean
-                    do_runtime_operate start gtm_proxy $name
+                get_process_status $RT_GTM_MASTER_HOST 20001 gtm
+                local s_gtm_master=$VARS
+                if [[ $s_gtm_master -ne $STATUS_RUNNING ]]; then
+                    continue 2
                 fi
+                rebuild_gtm_proxy "$name" clean
+                do_runtime_operate start gtm_proxy $name
             fi
         done
         
@@ -1429,14 +1561,26 @@ start_keeper(){
             get_process_status $slave 23001
             local s_slave=$VARS
             if [[ $s_master -eq $STATUS_STOPPED ]]; then
+                get_process_status $RT_GTM_MASTER_HOST 20001 gtm
+                local s_gtm_master=$VARS
+                if [[ $s_gtm_master -ne $STATUS_RUNNING ]]; then
+                    continue 2
+                fi
+                get_process_status $master 20002 gtm_proxy
+                local s_gtmpxy_host=$VARS
+                if [[ $s_gtmpxy_host -ne $STATUS_RUNNING ]]; then
+                    continue 2
+                fi
                 do_runtime_operate start datanode $name master
                 get_process_status $master 23001
                 s_master=$VARS
                 if [[ $s_master -ne $STATUS_RUNNING ]] && [[ $s_slave -eq $STATUS_RUNNING ]]; then
                     failover_datanode "$name"
+                    continue 2
                 fi
             elif [[ $s_master -eq $STATUS_HOSTDOWN ]] && [[ $s_slave -eq $STATUS_RUNNING ]]; then
                 failover_datanode "$name"
+                continue 2
             fi
             if [[ $s_slave -eq $STATUS_STOPPED ]]; then
                 is_remote_file_exists $slave $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pgxl.master
@@ -1464,17 +1608,30 @@ start_keeper(){
             get_process_status $host 21001
             local s_host=$VARS
             if [[ $s_host -eq $STATUS_STOPPED ]]; then
+                get_process_status $RT_GTM_MASTER_HOST 20001 gtm
+                local s_gtm_master=$VARS
+                if [[ $s_gtm_master -ne $STATUS_RUNNING ]]; then
+                    continue 2
+                fi
+                get_process_status $host 20002 gtm_proxy
+                local s_gtmpxy_host=$VARS
+                if [[ $s_gtmpxy_host -ne $STATUS_RUNNING ]]; then
+                    continue 2
+                fi
                 do_runtime_operate start coordinator $name
                 get_process_status $host 21001
                 s_host=$VARS
                 if [[ $s_host -ne $STATUS_RUNNING ]]; then
-                    remove_coordinator "$name"
-                    add_coordinator "$name" "clean"
-                    log "Try to remove and re-add coordinator $name"
+                    #prepare_register_sql delete $name
+                    #execute_register_sql
+                    #add_coordinator "$name" "clean"
+                    log "WARNING: Coordinator $name can not run. Try to unregister and re-add it"
                 else
                     prepare_register_sql
                     execute_register_sql
                 fi
+            elif [[ $s_host -ne $STATUS_RUNNING ]]; then
+                log "WARNING: Coordinator $name can not be connected"
             fi
         done
         
@@ -1536,9 +1693,8 @@ pgxl_init(){
 }
 
 pgxl_start(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
-    
     if [ "$MODE" == "all" ]; then 
         do_runtime_operate start gtm
         do_runtime_operate start gtm_proxy
@@ -1552,7 +1708,7 @@ pgxl_start(){
 }
 
 pgxl_stop(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "all" ]; then 
         do_runtime_operate stop coordinator
@@ -1562,12 +1718,12 @@ pgxl_stop(){
     elif [ "$MODE" == "keeper" ]; then 
         stop_keeper
     else 
-        do_runtime_operate stop "$MODE" "$NAME" "$ROLE"
+        do_runtime_stop_or_kill "$MODE" "$NAME" "$ROLE" 3
     fi
 }
 
 pgxl_restart(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "all" ]; then 
         do_runtime_operate stop coordinator
@@ -1579,14 +1735,13 @@ pgxl_restart(){
         do_runtime_operate start datanode
         do_runtime_operate start coordinator
     else 
-        do_runtime_operate stop "$MODE" "$NAME" "$ROLE"
-        do_runtime_operate kill "$MODE" "$NAME" "$ROLE"
+        do_runtime_stop_or_kill "$MODE" "$NAME" "$ROLE" 3
         do_runtime_operate start "$MODE" "$NAME" "$ROLE"
     fi
 }
 
 pgxl_kill(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "all" ]; then 
         do_runtime_operate kill coordinator
@@ -1599,7 +1754,7 @@ pgxl_kill(){
 }
 
 pgxl_status(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "all" ]; then 
         do_runtime_operate status gtm
@@ -1624,7 +1779,7 @@ pgxl_add(){
 }
 
 pgxl_remove(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "coordinator" ]; then 
         remove_coordinator "$NAME"
@@ -1636,7 +1791,7 @@ pgxl_remove(){
 }
 
 pgxl_failover(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "gtm" ]; then 
         failover_gtm
@@ -1646,7 +1801,7 @@ pgxl_failover(){
 }
 
 pgxl_rebuild(){
-    load_config "$CTL_HOME/$INIT_CONFIG"
+    #load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     if [ "$MODE" == "gtm" ]; then 
         rebuild_gtm_slave "$CONDITION"
@@ -1701,6 +1856,17 @@ pgxl_topology(){
     done
 }
 
+pgxl_clean_log(){
+    load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
+    if [ "$MODE" == "all" ] || [ "$MODE" == "coordinator" ]; then 
+        clean_coordinator_log "$CONDITION"
+    fi
+    if [ "$MODE" == "all" ] || [ "$MODE" == "datanode" ]; then 
+        clean_datanode_log "$CONDITION"
+    fi
+}
+
+
 pgxl_usage(){
     echo -e "
         Usage:
@@ -1751,11 +1917,18 @@ pgxl_usage(){
             11.HA keeper
                 ./pgxl_ctl.sh -m start -z keeper
                 ./pgxl_ctl.sh -m stop -z keeper
-            12.Others
+            12.Clean log
+                ./pgxl_ctl.sh -m clean_log -z all -c 14
+                ./pgxl_ctl.sh -m clean_log -z coordinator -c 30
+                ./pgxl_ctl.sh -m clean_log -z datanode -c 7
+            13.Export and import
                 pg_dumpall -p 21001 --clean --if-exists --inserts --file=dumpall.sql
                 psql -p 21001 -f dumpall.sql
                 pg_dumpall -p 21001 --clean --if-exists --inserts | gzip > dumpall.gz
                 gunzip -c dumpall.gz | psql -p 21001
+            14.Others
+                */1 * * * * flock -n /tmp/pgxl_keeper.lock -c '/bin/bash /home/postgres/pgxl_ctl/pgxl_ctl.sh -m start -z keeper'
+                0 0 * * * /bin/bash /home/postgres/pgxl_ctl/pgxl_ctl.sh -m clean_log -z all -c 30
     "
 }
 
@@ -1785,6 +1958,8 @@ case "$METHOD" in
     rebalance)         pgxl_rebalance
                        ;;
     topology)          pgxl_topology
+                       ;;
+    clean_log)         pgxl_clean_log
                        ;;
     *)                 pgxl_usage
                        ;;
