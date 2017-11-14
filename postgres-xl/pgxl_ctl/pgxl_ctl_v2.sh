@@ -6,6 +6,8 @@ PGXL_USER=postgres
 PGXL_DATA_HOME=/data/pgxl_data
 PGXL_LOG_HOME=/log/pgxl_log
 PGXL_XLOG_HOME=/log/pgxl_xlog
+PGXL_ALOG_HOME=/data/pgxl_alog
+PGXL_BACKUP_HOME=/data/pgxl_basebackup
 PGXL_TMP_DIR=/tmp
 GTM_DIR_NAME=gtm
 GTM_PROXY_DIR_NAME=gtm_pxy
@@ -264,9 +266,9 @@ get_process_status2(){
         elif [ "$role" == "slave" ]; then 
             find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_SLAVE_HOSTS[*]}"
             host=$VARS
-        elif [ "$role" == "hidden" ]; then 
-            find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
-            host=$VARS
+        #elif [ "$role" == "hidden" ]; then 
+        #    find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
+        #    host=$VARS
         fi
     fi
     get_process_status "$host" $port $special
@@ -333,6 +335,7 @@ edit_runtime_config(){
     fi
 }
 
+# pretreatment_remote_directory
 prepare_before_init(){
     local host=$1
     local dirname=$2
@@ -436,14 +439,14 @@ do_init_operate(){
                 local master=${DATANODE_MASTER_HOSTS[$i]}
                 local slave=${DATANODE_SLAVE_HOSTS[$i]}
                 local hidden=${DATANODE_HIDDEN_HOSTS[$i]}
+                if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
+                    init_datanode_hidden "$name" "$master" "$hidden" "$slave" $i "$l_con"
+                fi
                 if [ "$l_role" == "master" ] || [ "$l_role" == "" ]; then 
                     init_datanode_master "$name" "$master" "$slave" "$hidden" $i "$l_con"
                 fi
                 if [ "$l_role" == "slave" ] || [ "$l_role" == "" ]; then 
-                    init_datanode_slave "$name" "$master" "$slave" $i "$l_con"
-                fi
-                if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
-                    init_datanode_hidden "$name" "$master" "$hidden" $i "$l_con"
+                    init_datanode_slave "$name" "$master" "$slave" "$hidden" $i "$l_con"
                 fi
             done
         else
@@ -455,14 +458,14 @@ do_init_operate(){
             local hidden=$VARS
             find_index_by_name $l_name "${DATANODE_NAMES[*]}"
             local index=$VARS
+            if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
+                init_datanode_hidden $l_name "$master" "$hidden" "$slave" $index "$l_con"
+            fi
             if [ "$l_role" == "master" ] || [ "$l_role" == "" ]; then 
                 init_datanode_master $l_name "$master" "$slave" "$hidden" $index "$l_con"
             fi
             if [ "$l_role" == "slave" ] || [ "$l_role" == "" ]; then 
-                init_datanode_slave $l_name "$master" "$slave" $index "$l_con"
-            fi
-            if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
-                init_datanode_hidden $l_name "$master" "$hidden" $index "$l_con"
+                init_datanode_slave $l_name "$master" "$slave" "$hidden" $index "$l_con"
             fi
         fi
     fi
@@ -690,22 +693,19 @@ init_datanode_master_config(){
         rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/backup_label.old
         touch $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pgxl.master
     "
-    local pg_alog_dir=$PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_alog
-    if [ "$PGXL_XLOG_HOME" != "" ]; then
-        pg_alog_dir=$PGXL_XLOG_HOME/$DATANODE_DIR_NAME/pg_alog
-    fi
-    if [ "$slave" != "" ] && [ "$hidden" != "" ]; then 
+    local pg_alog_dir=$PGXL_ALOG_HOME/$name
+    if [ "$hidden" != "" ]; then 
         ssh -p $PORT_SSH $PGXL_USER@$master "
-            sed -i \"s|^archive_command.*|archive_command = \'rsync -e \\\"ssh -p $PORT_SSH\\\" %p $PGXL_USER@$slave:$pg_alog_dir/%f ; rsync -z -e \\\"ssh -p $PORT_SSH\\\" %p $PGXL_USER@$hidden:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
+            sed -i \"s|^archive_command.*|archive_command = \'scp -P $PORT_SSH %p $PGXL_USER@$hidden:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         "
     elif [ "$slave" != "" ]; then 
         ssh -p $PORT_SSH $PGXL_USER@$master "
-            sed -i \"s|^archive_command.*|archive_command = \'rsync -e \\\"ssh -p $PORT_SSH\\\" %p $PGXL_USER@$slave:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
+            sed -i \"s|^archive_command.*|archive_command = \'scp -P $PORT_SSH %p $PGXL_USER@$slave:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         "
-    elif [ "$hidden" != "" ]; then 
-        ssh -p $PORT_SSH $PGXL_USER@$master "
-            sed -i \"s|^archive_command.*|archive_command = \'rsync -z -e \\\"ssh -p $PORT_SSH\\\" %p $PGXL_USER@$hidden:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
-        "
+    #elif [ "$hidden" != "" ]; then 
+    #    ssh -p $PORT_SSH $PGXL_USER@$master "
+    #        sed -i \"s|^archive_command.*|archive_command = \'rsync -z -e \\\"ssh -p $PORT_SSH\\\" %p $PGXL_USER@$hidden:$pg_alog_dir/%f\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
+    #    "
     else
         ssh -p $PORT_SSH $PGXL_USER@$master "
             sed -i \"s/^archive_mode.*/archive_mode = off/g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
@@ -730,12 +730,13 @@ init_datanode_slave(){
     local name=$1
     local master=$2
     local slave=$3
-    local index=$4
-    local condition=$5
+    local hidden=$4
+    local index=$5
+    local condition=$6
     log ">>>>>> Init datanode slave name: $name . slave: $slave"
     if [ "$slave" != "" ]; then
         if [ "$condition" == "config" ]; then
-            init_datanode_slave_config "$name" $master $slave
+            init_datanode_slave_config "$name" $master $slave $hidden
         else
             prepare_before_init $slave $DATANODE_DIR_NAME $condition
             is_remote_dir_exists $slave $PGXL_DATA_HOME/$DATANODE_DIR_NAME
@@ -743,9 +744,9 @@ init_datanode_slave(){
             if [[ $resp -eq $TRUE ]]; then
                 log "WARNING: Init skip. Datanode slave $name exists"
             elif [[ $resp -eq $FALSE ]]; then
-                local rs=`ssh -p $PORT_SSH $PGXL_USER@$slave "pg_basebackup -p $PORT_DN -h $master -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME -x"`
+                local rs=`ssh -p $PORT_SSH $PGXL_USER@$slave "pg_basebackup -p $PORT_DN -h $master -c fast -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME"`
                 log "$rs"
-                init_datanode_slave_config "$name" $master $slave
+                init_datanode_slave_config "$name" $master $slave $hidden
                 edit_runtime_config "RT_DATANODE_NAMES" "$name" $index
                 edit_runtime_config "RT_DATANODE_SLAVE_HOSTS" "$slave" $index
                 log "Init datanode slave $name $slave done"
@@ -758,10 +759,7 @@ init_datanode_slave_config(){
     local name=$1
     local master=$2
     local slave=$3
-    local pg_alog_dir=$PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_alog
-    if [ "$PGXL_XLOG_HOME" != "" ]; then
-        pg_alog_dir=$PGXL_XLOG_HOME/$DATANODE_DIR_NAME/pg_alog
-    fi
+    local hidden=$4
     scp -P $PORT_SSH $CTL_ETC_DIR/$TEMPLATE_HBA_DN $PGXL_USER@$slave:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_hba.conf 1>/dev/null
     scp -P $PORT_SSH $CTL_ETC_DIR/$TEMPLATE_DN_SLAVE $PGXL_USER@$slave:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf 1>/dev/null
     scp -P $PORT_SSH $CTL_ETC_DIR/$TEMPLATE_DN_RECOVERY $PGXL_USER@$slave:$PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf 1>/dev/null
@@ -771,14 +769,24 @@ init_datanode_slave_config(){
         rm -f ~/.pgpass;
         ln -s $PGXL_DATA_HOME/$TEMPLATE_PGPASS ~/.pgpass;
         mkdir -p $PGXL_LOG_HOME/$DATANODE_DIR_NAME;
-        mkdir -m 700 -p $pg_alog_dir;
         sed -i \"s/^pgxc_node_name.*/pgxc_node_name = \'$name\'/g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         sed -i \"s|^log_directory.*|log_directory = \'$PGXL_LOG_HOME/$DATANODE_DIR_NAME\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf;
         sed -i \"s|^primary_conninfo.*|primary_conninfo = \'host = $master port = $PORT_DN user = $PGXL_USER application_name = $name\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
-        sed -i \"s|^restore_command.*|restore_command = \'cp $pg_alog_dir/%f %p\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
-        sed -i \"s|^archive_cleanup_command.*|archive_cleanup_command = \'pg_archivecleanup $pg_alog_dir %r\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
         rm -f $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pgxl.master;
     "
+    local pg_alog_dir=$PGXL_ALOG_HOME/$name
+    if [ "$hidden" != "" ]; then 
+        ssh -p $PORT_SSH $PGXL_USER@$slave "
+            sed -i \"s|^restore_command.*|restore_command = \'scp -P $PORT_SSH $PGXL_USER@$hidden:$pg_alog_dir/%f %p\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
+            sed -i \"s|^archive_cleanup_command.*|archive_cleanup_command = \'/bin/date\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
+        "
+    else
+        ssh -p $PORT_SSH $PGXL_USER@$slave "
+            mkdir -m 700 -p $pg_alog_dir;
+            sed -i \"s|^restore_command.*|restore_command = \'cp $pg_alog_dir/%f %p\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
+            sed -i \"s|^archive_cleanup_command.*|archive_cleanup_command = \'pg_archivecleanup $pg_alog_dir %r\'|g\" $PGXL_DATA_HOME/$DATANODE_DIR_NAME/recovery.conf;
+        "
+    fi
     if [ "$PGXL_XLOG_HOME" != "" ]; then
         ssh -p $PORT_SSH $PGXL_USER@$slave "
             mkdir -p $PGXL_XLOG_HOME/$DATANODE_DIR_NAME;
@@ -786,7 +794,6 @@ init_datanode_slave_config(){
             test ! -L $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_xlog && ln -s $PGXL_XLOG_HOME/$DATANODE_DIR_NAME/pg_xlog $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_xlog;
         "
     fi
-    
     rs=`ssh -p $PORT_SSH $PGXL_USER@$slave "cat $PGXL_DATA_HOME/$DATANODE_DIR_NAME/postgresql.conf"`
     log "Datanode slave $name config: \n$rs"
     rs=`ssh -p $PORT_SSH $PGXL_USER@$slave "cat $PGXL_DATA_HOME/$DATANODE_DIR_NAME/pg_hba.conf"`
@@ -797,27 +804,26 @@ init_datanode_hidden(){
     local name=$1
     local master=$2
     local hidden=$3
-    local index=$4
-    local condition=$5
-    log ">>>>>> Init datanode hidden name: $name . hidden: $hidden"
+    local slave=$4
+    local index=$5
+    local condition=$6
+    local host=""
     if [ "$hidden" != "" ]; then
-        if [ "$condition" == "config" ]; then
-            init_datanode_hidden_config "$name" $master $hidden
-        else
-            prepare_before_init $hidden $DATANODE_DIR_NAME $condition
-            is_remote_dir_exists $hidden $PGXL_DATA_HOME/$DATANODE_DIR_NAME
-            local resp=$VARS
-            if [[ $resp -eq $TRUE ]]; then
-                log "WARNING: Init skip. Datanode hidden $name exists"
-            elif [[ $resp -eq $FALSE ]]; then
-                local rs=`ssh -p $PORT_SSH $PGXL_USER@$hidden "pg_basebackup -p $PORT_DN -h $master -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME -x"`
-                log "$rs"
-                init_datanode_hidden_config "$name" $master $hidden
-                edit_runtime_config "RT_DATANODE_NAMES" "$name" $index
-                edit_runtime_config "RT_DATANODE_HIDDEN_HOSTS" "$hidden" $index
-                log "Init datanode hidden $name $hidden done"
-            fi
+        host=$hidden
+    elif [ "$slave" != "" ]; then
+        host=$slave
+    fi
+    if [ "$host" != "" ]; then
+        log ">>>>>> Init datanode hidden name: $name . host: $host"
+        if [ "$condition" == "clean" ]; then
+            log "Clean $host $PGXL_ALOG_HOME/$name"
+            ssh -p $PORT_SSH $PGXL_USER@$host "cd $PGXL_ALOG_HOME/;rm -rf $name 2>/dev/null"
         fi
+        local pg_alog_dir=$PGXL_ALOG_HOME/$name
+        ssh -p $PORT_SSH $PGXL_USER@$host "mkdir -p $pg_alog_dir"
+        edit_runtime_config "RT_DATANODE_NAMES" "$name" $index
+        edit_runtime_config "RT_DATANODE_HIDDEN_HOSTS" "$host" $index
+        log "Init datanode hidden $name $host done"
     fi
 }
 
@@ -1168,26 +1174,26 @@ do_runtime_operate(){
                     op_write_log $operate "$name" "$slave"
                 done
             fi
-            if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
-                local i
-                for (( i=0; i<$length; i++ ))
-                do
-                {
-                    local name=${RT_DATANODE_NAMES[$i]}
-                    local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
-                    op_datanode $operate "$name" "$hidden"
-                }&
-                done
-                wait
-                sleep 1
-                local i
-                for (( i=0; i<$length; i++ ))
-                do
-                    local name=${RT_DATANODE_NAMES[$i]}
-                    local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
-                    op_write_log $operate "$name" "$hidden"
-                done
-            fi
+            #if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
+            #    local i
+            #    for (( i=0; i<$length; i++ ))
+            #    do
+            #    {
+            #        local name=${RT_DATANODE_NAMES[$i]}
+            #        local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+            #        op_datanode $operate "$name" "$hidden"
+            #    }&
+            #    done
+            #    wait
+            #    sleep 1
+            #    local i
+            #    for (( i=0; i<$length; i++ ))
+            #    do
+            #        local name=${RT_DATANODE_NAMES[$i]}
+            #        local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+            #        op_write_log $operate "$name" "$hidden"
+            #    done
+            #fi
         else
             if [ "$l_role" == "master" ] || [ "$l_role" == "" ]; then 
                 find_host_by_name $l_name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_MASTER_HOSTS[*]}"
@@ -1207,15 +1213,15 @@ do_runtime_operate(){
                     op_write_log $operate $l_name "$host"
                 fi
             fi
-            if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
-                find_host_by_name $l_name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
-                local host=$VARS
-                if [ "$host" != "" ]; then 
-                    op_datanode $operate $l_name "$host"
-                    sleep 1
-                    op_write_log $operate $l_name "$host"
-                fi
-            fi
+            #if [ "$l_role" == "hidden" ] || [ "$l_role" == "" ]; then 
+            #    find_host_by_name $l_name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
+            #    local host=$VARS
+            #    if [ "$host" != "" ]; then 
+            #        op_datanode $operate $l_name "$host"
+            #        sleep 1
+            #        op_write_log $operate $l_name "$host"
+            #    fi
+            #fi
         fi
     fi
 }
@@ -1454,9 +1460,9 @@ failover_datanode(){
             do_runtime_operate kill coordinator
             do_runtime_operate start coordinator
             log "Fail over datanode $l_name done"
-            do_runtime_operate stop datanode "$l_name" "hidden"
-            rebuild_datanode_hidden $l_name backup
-            do_runtime_operate start datanode "$l_name" "hidden"
+            #do_runtime_operate stop datanode "$l_name" "hidden"
+            #rebuild_datanode_hidden $l_name backup
+            #do_runtime_operate start datanode "$l_name" "hidden"
         fi
     fi
 }
@@ -1514,6 +1520,8 @@ rebuild_datanode_slave(){
         local master=$VARS
         find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_SLAVE_HOSTS[*]}"
         local slave=$VARS
+        find_host_by_name $name "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
+        local hidden=$VARS
         find_index_by_name $name "${RT_DATANODE_NAMES[*]}"
         local index=$VARS
         if [ "$master" != "" ] && [ "$slave" != "" ]; then 
@@ -1521,7 +1529,7 @@ rebuild_datanode_slave(){
             local status=$VARS
             if [[ $status -eq $STATUS_STOPPED ]]; then
                 log ">>>>>> Rebuild datanode slave $name $master $slave $condition"
-                init_datanode_slave $name "$master" "$slave" $index "$condition"
+                init_datanode_slave $name "$master" "$slave" "$hidden" $index "$condition"
                 log "Rebuild datanode slave $name $slave done"
             else
                 log "ERROR: Cannot rebuild datanode slave ${name} $slave. Node is not stopped. Try to run $0 -m stop -z datanode -n ${name} -r slave"
@@ -1549,7 +1557,7 @@ rebuild_datanode_hidden(){
             local status=$VARS
             if [[ $status -eq $STATUS_STOPPED ]]; then
                 log ">>>>>> Rebuild datanode hidden $name $master $hidden $condition"
-                init_datanode_hidden $name "$master" "$hidden" $index "$condition"
+                init_datanode_hidden $name "$master" "$hidden" "" $index "$condition"
                 log "Rebuild datanode hidden $name $hidden done"
             else
                 log "ERROR: Cannot rebuild datanode hidden ${name} $hidden. Node is not stopped. Try to run $0 -m stop -z datanode -n ${name} -r hidden"
@@ -1799,16 +1807,16 @@ clean_datanode_log(){
             local name=${RT_DATANODE_NAMES[$i]}
             local master=${RT_DATANODE_MASTER_HOSTS[$i]}
             local slave=${RT_DATANODE_SLAVE_HOSTS[$i]}
-            local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+            #local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
             if [ "$master" != "" ]; then 
                 ssh -p $PORT_SSH $PGXL_USER@$master "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
             fi
             if [ "$slave" != "" ]; then 
                 ssh -p $PORT_SSH $PGXL_USER@$slave "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
             fi
-            if [ "$hidden" != "" ]; then 
-                ssh -p $PORT_SSH $PGXL_USER@$hidden "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
-            fi
+            #if [ "$hidden" != "" ]; then 
+            #    ssh -p $PORT_SSH $PGXL_USER@$hidden "find $PGXL_LOG_HOME/$DATANODE_DIR_NAME/ -name \"*.log*\" -mtime +$days -delete;"
+            #fi
         done
     fi
 }
@@ -1890,13 +1898,13 @@ start_keeper(){
             local name=${RT_DATANODE_NAMES[$i]}
             local master=${RT_DATANODE_MASTER_HOSTS[$i]}
             local slave=${RT_DATANODE_SLAVE_HOSTS[$i]}
-            local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+            #local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
             get_process_status "$master" $PORT_DN
             local s_master=$VARS
             get_process_status "$slave" $PORT_DN
             local s_slave=$VARS
-            get_process_status "$hidden" $PORT_DN
-            local s_hidden=$VARS
+            #get_process_status "$hidden" $PORT_DN
+            #local s_hidden=$VARS
             if [[ $s_master -eq $STATUS_STOPPED ]]; then
                 get_process_status "$RT_GTM_MASTER_HOST" $PORT_GTM gtm
                 local s_gtm_master=$VARS
@@ -1933,15 +1941,15 @@ start_keeper(){
                     do_runtime_operate start datanode $name slave
                 fi
             fi
-            if [[ $s_hidden -eq $STATUS_STOPPED ]]; then
-                do_runtime_operate start datanode $name hidden
-                get_process_status "$hidden" $PORT_DN
-                s_hidden=$VARS
-                if [[ $s_hidden -ne $STATUS_RUNNING ]]; then
-                    rebuild_datanode_hidden $name clean
-                    do_runtime_operate start datanode $name hidden
-                fi
-            fi
+            #if [[ $s_hidden -eq $STATUS_STOPPED ]]; then
+            #   do_runtime_operate start datanode $name hidden
+            #    get_process_status "$hidden" $PORT_DN
+            #    s_hidden=$VARS
+            #    if [[ $s_hidden -ne $STATUS_RUNNING ]]; then
+            #        rebuild_datanode_hidden $name clean
+            #        do_runtime_operate start datanode $name hidden
+            #    fi
+            #fi
         done
         
         # coordinator
@@ -2014,6 +2022,9 @@ pgxl_init(){
         else
             do_init_operate gtm "" "" "$CONDITION"
             do_init_operate gtm_proxy "" "" "$CONDITION"
+            
+            do_init_operate datanode "" "hidden" "$CONDITION"
+            
             do_init_operate datanode "" "master" "$CONDITION"
             do_init_operate coordinator "" "" "$CONDITION"
             
@@ -2023,10 +2034,9 @@ pgxl_init(){
             do_runtime_operate start coordinator
             
             do_init_operate datanode "" "slave" "$CONDITION"
-            do_init_operate datanode "" "hidden" "$CONDITION"
             
             do_runtime_operate start datanode "" "slave"      # need to start master and slave before register nodes if synchronous_standby_names is not empty
-            do_runtime_operate start datanode "" "hidden"
+            #do_runtime_operate start datanode "" "hidden"
             
             prepare_register_sql
             execute_register_sql
@@ -2170,8 +2180,8 @@ pgxl_rebuild(){
         rebuild_gtm_proxy "$NAME" "$CONDITION"
     elif [ "$MODE" == "datanode_slave" ]; then 
         rebuild_datanode_slave "$NAME" "$CONDITION"
-    elif [ "$MODE" == "datanode_hidden" ]; then 
-        rebuild_datanode_hidden "$NAME" "$CONDITION"
+    #elif [ "$MODE" == "datanode_hidden" ]; then 
+    #    rebuild_datanode_hidden "$NAME" "$CONDITION"
     fi
 }
 
@@ -2212,16 +2222,16 @@ pgxl_topology(){
         local name=${RT_DATANODE_NAMES[$i]}
         local master=${RT_DATANODE_MASTER_HOSTS[$i]}
         local slave=${RT_DATANODE_SLAVE_HOSTS[$i]}
-        local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+        #local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
         if [ "$master" != "" ]; then 
             echo -e "[DATANODE] ${name}:master:${master}:$(get_process_status_info $master $PORT_DN)"
         fi
         if [ "$slave" != "" ]; then 
             echo -e "[DATANODE] ${name}:slave:${slave}:$(get_process_status_info $slave $PORT_DN)"
         fi
-        if [ "$hidden" != "" ]; then 
-            echo -e "[DATANODE] ${name}:hidden:${hidden}:$(get_process_status_info $hidden $PORT_DN)"
-        fi
+        #if [ "$hidden" != "" ]; then 
+        #    echo -e "[DATANODE] ${name}:hidden:${hidden}:$(get_process_status_info $hidden $PORT_DN)"
+        #fi
     }&
     done
     wait
@@ -2254,11 +2264,11 @@ pgxl_clean_prepared_xacts(){
     load_config "$CTL_HOME/$INIT_CONFIG"
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     local min_ago=$CONDITION
-	if [ "$min_ago" == "" ]; then
-	    min_ago=5
-	    echo "use default 5 min ago"
-	fi
-	local dt=`date -d "${min_ago} min ago" +"%Y-%m-%d %H:%M.%S"`
+    if [ "$min_ago" == "" ]; then
+        min_ago=5
+        echo "use default 5 min ago"
+    fi
+    local dt=`date -d "${min_ago} min ago" +"%Y-%m-%d %H:%M.%S"`
     local length=${#RT_DATANODE_NAMES[@]}
     local length_db=${#DATABASES[@]}
     local i
@@ -2285,6 +2295,73 @@ pgxl_clean_prepared_xacts(){
             fi
         fi
     done
+}
+
+pgxl_clean_achieve_log(){
+    load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
+    local kept_count=${CONDITION}
+    if [ "${kept_count}" != "" ]; then 
+        log ">>>>>> Execute clean achieve log on ${MODE}. Keep count ${kept_count}"
+        if [ "$MODE" == "all" ] || [ "$MODE" == "coordinator" ]; then 
+            local length=${#RT_DATANODE_NAMES[@]}
+            local i
+            for (( i=0; i<$length; i++ ))
+            do
+                local name=${RT_COORDINATOR_NAMES[$i]}
+                local hidden=${RT_COORDINATOR_HIDDEN_HOSTS[$i]}
+                if [ "$hidden" != "" ]; then 
+                    ssh -p $PORT_SSH $PGXL_USER@$hidden "ls -t ${PGXL_ALOG_HOME}/${name}/* |tail -n +${kept_count} |xargs rm -f"
+                fi
+            done
+        fi
+        if [ "$MODE" == "all" ] || [ "$MODE" == "datanode" ]; then 
+            local length=${#RT_DATANODE_NAMES[@]}
+            local i
+            for (( i=0; i<$length; i++ ))
+            do
+                local name=${RT_DATANODE_NAMES[$i]}
+                local hidden=${RT_DATANODE_HIDDEN_HOSTS[$i]}
+                if [ "$hidden" != "" ]; then 
+                    ssh -p $PORT_SSH $PGXL_USER@$hidden "ls -t ${PGXL_ALOG_HOME}/${name}/* |tail -n +${kept_count} |xargs rm -f"
+                fi
+            done
+        fi
+    fi
+}
+
+pgxl_basebackup(){
+    load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
+    local dir_datetime="$(date '+%Y%m%d-%H%M%S')"
+    local kept_count=${CONDITION}
+    if [ "$kept_count" == "" ]; then 
+        kept_count=3
+    fi
+    log ">>>>>> Execute base backup on ${MODE} ${NAME}. Keep count ${kept_count}"
+    if [ "$MODE" == "coordinator" ]; then 
+        find_host_by_name "$NAME" "${RT_COORDINATOR_NAMES[*]}" "${RT_COORDINATOR_MASTER_HOSTS[*]}"
+        local master=$VARS
+        find_host_by_name "$NAME" "${RT_COORDINATOR_NAMES[*]}" "${RT_COORDINATOR_HIDDEN_HOSTS[*]}"
+        local hidden=$VARS
+        if [ "$hidden" != "" ]; then 
+            ssh -p $PORT_SSH $PGXL_USER@$hidden "
+                mkdir -p $PGXL_BACKUP_HOME/$NAME/${dir_datetime};
+                ls -d $PGXL_BACKUP_HOME/$NAME/* -1 |sort -r -n |tail -n +${kept_count} |xargs rm -rf;
+                pg_basebackup -p $PORT_DN -h $master -c fast -D $PGXL_BACKUP_HOME/$NAME/${dir_datetime};
+            "
+        fi
+    elif [ "$MODE" == "datanode" ]; then 
+        find_host_by_name "$NAME" "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_MASTER_HOSTS[*]}"
+        local master=$VARS
+        find_host_by_name "$NAME" "${RT_DATANODE_NAMES[*]}" "${RT_DATANODE_HIDDEN_HOSTS[*]}"
+        local hidden=$VARS
+        if [ "$hidden" != "" ]; then 
+            ssh -p $PORT_SSH $PGXL_USER@$hidden "
+                mkdir -p $PGXL_BACKUP_HOME/$NAME/${dir_datetime};
+                ls -d $PGXL_BACKUP_HOME/$NAME/* -1 |sort -r -n |tail -n +${kept_count} |xargs rm -rf;
+                pg_basebackup -p $PORT_DN -h $master -c fast -D $PGXL_BACKUP_HOME/$NAME/${dir_datetime};
+            "
+        fi
+    fi
 }
 
 pgxl_usage(){
@@ -2388,6 +2465,10 @@ case "$METHOD" in
     clean_log)             pgxl_clean_log
                            ;;
     clean_px)              pgxl_clean_prepared_xacts
+                           ;;
+    backup)                pgxl_basebackup
+                           ;;
+    clean_achieve_log)     pgxl_clean_achieve_log
                            ;;
     *)                     pgxl_usage
                            ;;

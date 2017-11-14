@@ -1,0 +1,51 @@
+yum update -y
+
+yum install -y epel-release
+
+yum install -y automake \
+    make \
+    gcc \
+    gcc-c++ \
+    openssh-server \
+    openssh-clients \
+    tuned \
+    less \
+    rsync \
+    nc \
+    telnet \
+    net-tools \
+    git \
+    nload \
+    wget \
+    curl \
+    nano \
+    iftop \
+    ngrep \
+    sysstat \
+    tcpdump \
+    lsof \
+    gdb \
+    coreutils \
+    smartmontools \
+    ntpdate \
+    iotop
+
+yum install -y flex \
+    bison \
+    kernel-devel \
+    readline-devel \
+    zlib-devel \
+    libxml2 \
+    libxml2-devel \
+    libxslt \
+    libxslt-devel \
+    uuid uuid-devel \
+    openssl-devel pam-devel \
+    python python-devel \
+    tcl-devel \
+    perl-devel openldap-devel
+    
+         
+
+  
+  
