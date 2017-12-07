@@ -1,0 +1,22 @@
+systemLog:
+   destination: file
+   path: "/data/log/mongodb/config/config.log"
+   logAppend: false
+storage:
+   dbPath: "/data/mongodb/config"
+   engine: "wiredTiger"
+   journal:
+      enabled: false
+   wiredTiger:
+      engineConfig:
+         cacheSizeGB: 1
+         directoryForIndexes: true
+   directoryPerDB: true
+processManagement:
+   fork: true
+net:
+   port: 21000
+sharding:
+   clusterRole: "configsvr"
+replication:
+   replSetName: "configReplSet"

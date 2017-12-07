@@ -1,0 +1,10 @@
+systemLog:
+   destination: file
+   path: "/data/log/mongodb/mongos/mongos.log"
+   logAppend: false
+processManagement:
+   fork: true
+net:
+   port: 20000
+sharding:
+   configDB: "configReplSet/mongodb-na-c1:21000,mongodb-na-c2:21000,mongodb-na-c3:21000"

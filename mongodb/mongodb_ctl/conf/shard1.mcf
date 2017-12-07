@@ -1,0 +1,23 @@
+systemLog:
+   destination: file
+   path: "/data/log/mongodb/shard1/shard1.log"
+   logAppend: false
+storage:
+   dbPath: "/data/mongodb/shard1"
+   engine: "wiredTiger"
+   journal:
+      enabled: false
+   wiredTiger:
+      engineConfig:
+         cacheSizeGB: 50
+         directoryForIndexes: true
+   directoryPerDB: true
+processManagement:
+   fork: true
+net:
+   port: 22001
+replication:
+   replSetName: "shard1"
+   oplogSizeMB: 10240
+sharding:
+   clusterRole: "shardsvr"
