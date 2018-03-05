@@ -33,15 +33,15 @@ RUNTIME_CONFIG=pgxl_runtime.conf
 REGISTER_SQL=register_nodes.sql
 REBALANCE_SQL=rebalance_data.sql
 ROLLBACK_SQL=rollback_px.sql
-VACUUM_FREEZE_SQL=vacuum_freeze.sql
+VACUUM_FREEZE_SQL=vacuum_freeze_dbs.sql
+ANALYZE_SQL=analyze_dbs.sql
 LOG_FILE=pgxl_ctl.log
 
 TRUE=1
 FALSE=2
 STATUS_RUNNING=1
 STATUS_STOPPED=2
-STATUS_HOSTDOWN=3
-STATUS_ERROR=100
+STATUS_UNREACHABLE=3
 KEEPER_INTERVAL=5s
 
 # template
@@ -69,7 +69,7 @@ declare -A COORDINATOR_HOSTS
 
 # variables in RUNTIME_CONFIG file
 declare RT_GTM_MASTER_HOST RT_GTM_STANDBY_HOST
-declare -a RT_GTM_PROXY_NAMES RT_DATANODE_NAMES RT_COORDINATOR_NAMES
+declare -a RT_GTM_PROXY_NAMES RT_DATANODE_NAMES RT_COORDINATOR_NAMES RT_DBS
 declare -A RT_GTM_PROXY_HOSTS
 declare -A RT_DATANODE_MASTER_HOSTS RT_DATANODE_STANDBY_HOSTS RT_DATANODE_BACKUP_HOSTS
 declare -A RT_COORDINATOR_HOSTS
@@ -107,8 +107,8 @@ shift $((OPTIND-1))
 
 log(){
     local lines=$1
-    echo -e "$lines" | awk -v date="$(date '+%Y-%m-%d %H:%M:%S')" '{if(NF){print date" "$0}}' >> $CTL_LOG_DIR/$LOG_FILE
-    echo -e "$lines" | awk '{if(NF){print $0}}'
+    echo "$lines" | awk -v date="$(date '+%Y-%m-%d %H:%M:%S')" '{if(NF){print date" "$0}}' >> $CTL_LOG_DIR/$LOG_FILE
+    echo "$lines" | awk '{if(NF){print $0}}'
 }
 # functions and variables are not accessible in separate programs, e.g. when run "bash -c ...". 
 # so "declare -x" or "export" them for the next usage like this, "| xargs -0 -n1 -r bash -c 'log "$@"' _"
@@ -188,6 +188,10 @@ load_config(){
 
 get_node_status(){
     get_node_status_by_nmap "$1" "$2"
+    if [[ $VARS -eq $STATUS_UNREACHABLE ]]; then
+        sleep 1s
+        get_node_status_by_nmap "$1" "$2"
+    fi
 }
 
 # user need to run nmap as root. visudo add 'postgres ALL=(ALL)  NOPASSWD: /usr/bin/nmap'
@@ -195,17 +199,17 @@ get_node_status_by_nmap(){
     local host=$1
     local port=$2
     if [ -z $host ] || [ -z $port ]; then
-        VARS=$STATUS_ERROR
+        VARS=$STATUS_UNREACHABLE
     else
         local resp=`sudo -n nmap $host -p $port |grep "$port/tcp" |awk '{print $2}'`
         if [ "$resp" == "" ]; then
-            VARS=$STATUS_HOSTDOWN
+            VARS=$STATUS_UNREACHABLE
         elif [ "$resp" == "open" ]; then
             VARS=$STATUS_RUNNING
         elif [ "$resp" == "closed" ]; then
             VARS=$STATUS_STOPPED
         else
-            VARS=$STATUS_ERROR
+            VARS=$STATUS_UNREACHABLE
         fi
     fi
 }
@@ -214,14 +218,14 @@ get_node_status_by_ssh(){
     local host=$1
     local port=$2
     if [ -z $host ] || [ -z $port ]; then
-        VARS=$STATUS_ERROR
+        VARS=$STATUS_UNREACHABLE
     else
         # by the way, do not use telnet to check port of postgres or gtm. it create a complete connection to pg, and will make pg error.
         #local resp=`echo -e "\n" | timeout 1 telnet $host $PORT_SSH 2>/dev/null | grep Connected`
         local resp
         ping -c 1 -w 1 $host &>/dev/null && resp="Connected" || resp=""
         if [ "$resp" == "" ]; then
-            VARS=$STATUS_HOSTDOWN
+            VARS=$STATUS_UNREACHABLE
         else
             # it is simpler to use pidof gtm or gtm_proxy. but the server may does not install pidof.
             if [ "$port" == "$PORT_GTM" ]; then
@@ -247,7 +251,7 @@ get_node_status_info(){
         echo -e "\e[1;32mRunning\e[0m"
     elif [[ $status -eq $STATUS_STOPPED ]]; then
         echo -e "\e[1;33mStopped\e[0m"
-    elif [[ $status -eq $STATUS_HOSTDOWN ]]; then
+    elif [[ $status -eq $STATUS_UNREACHABLE ]]; then
         echo -e "\e[1;31mHostdown\e[0m"
     else
         echo -e "\e[1;41mERROR\e[0m"
@@ -259,6 +263,7 @@ search_an_active_host(){
     local hosts=($1)
     local port=$2
     local excluded=$3
+    local host
     for host in ${hosts[*]}; do
         if [ "$host" != "$excluded" ]; then 
             get_node_status "$host" $port
@@ -276,6 +281,14 @@ is_remote_dir_exists(){
 # $1 is host, $2 is file
 is_remote_file_exists(){
     [ "`ssh $1 "ls $2 2>/dev/null"`" == "$2" ] && VARS=$TRUE || VARS=$FALSE
+}
+
+# lock before add node
+is_cluster_locked_for_ddl(){
+    search_an_active_host "${RT_COORDINATOR_HOSTS[*]}" $PORT_COORD
+    local host=$VARS
+    local rs=`ssh $host "psql -p $PORT_COORD -c \"select pgxc_lock_for_backup();\" -t 2>&1" |grep 'lock is already held' |wc -l`
+    [[ $rs -gt 0 ]] && VARS=$TRUE || VARS=$FALSE
 }
 
 # clean or backup existed data directory
@@ -309,20 +322,24 @@ is_datanode_ready_to_be_removed(){
     local host=$VARS
     local sql="select count(*) from pgxc_class c where exists (select node_name from pgxc_node n where n.node_name = '$name' and (c.nodeoids::oid[] @> ARRAY[n.oid]));"
     VARS=$TRUE
-    local dbs=(`ssh $host "psql -p $PORT_COORD -t -c \"select datname from pg_database;\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`)
-    for dbname in ${dbs[*]}; do
+    load_databases $host $PORT_COORD
+    for dbname in ${RT_DBS[*]}; do
         local count=`ssh $host "psql -p $PORT_COORD -d $dbname -t -c \"$sql\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`
-        if [[ $count -gt 0 ]]; then 
-            VARS=$FALSE
-            break
-        fi
+        [[ $count -gt 0 ]] && VARS=$FALSE && break
     done
+}
+
+load_databases(){
+    local host=$1
+    local port=$2
+    [[ ${#RT_DBS[@]} -eq 0 ]] && RT_DBS=(`ssh $host "psql -p $port -t -c \"select datname from pg_database;\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`)
 }
 
 prepare_register_sql(){
     local operate=$1
     local node=$2
     local primary=${RT_DATANODE_NAMES[0]}
+    local name
     echo "" > $CTL_RUN_DIR/$REGISTER_SQL
     if [ "$operate" == "delete" ] && [ "$node" != "$primary" ]; then
         echo "DROP NODE $node;" >> $CTL_RUN_DIR/$REGISTER_SQL
@@ -355,8 +372,8 @@ prepare_rebalance_sql(){
     local condition=$3
     local shell_cmds=""
     echo "SET statement_timeout = 0;" > $CTL_RUN_DIR/$REBALANCE_SQL
-    local dbs=(`ssh $host "psql -p $PORT_COORD -t -c \"select datname from pg_database;\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`)
-    for dbname in ${dbs[*]}; do
+    load_databases $host $PORT_COORD
+    for dbname in ${RT_DBS[*]}; do
         shell_cmds=${shell_cmds}"echo \"\c $dbname\";"
         if [ "$condition" == "add" ]; then
             shell_cmds=${shell_cmds}"
@@ -370,6 +387,23 @@ prepare_rebalance_sql(){
     done
     [ -z "$shell_cmds" ] || ssh $host "$shell_cmds" >> $CTL_RUN_DIR/$REBALANCE_SQL 2>/dev/null
     run_cmd_on local "echo \"Rebalance SQL:\";cat $CTL_RUN_DIR/$REBALANCE_SQL"
+}
+
+prepare_analyze_sql(){
+    local mode=$1
+    local host=$2
+    echo "SET statement_timeout = '1h';" > $CTL_RUN_DIR/$ANALYZE_SQL
+    load_databases $host $PORT_COORD
+    for dbname in ${RT_DBS[*]}; do
+        [ "$dbname" == "template0" ] && continue
+        echo "\c $dbname" >> $CTL_RUN_DIR/$ANALYZE_SQL
+        if [ -z $mode ] || [ "$mode" == "all" ]; then 
+            echo "ANALYZE;" >> $CTL_RUN_DIR/$ANALYZE_SQL
+        elif [ "$mode" == "coordinator" ]; then 
+            echo "ANALYZE (coordinator);" >> $CTL_RUN_DIR/$ANALYZE_SQL
+        fi
+    done
+    run_cmd_on local "echo \"Rebalance SQL:\";cat $CTL_RUN_DIR/$ANALYZE_SQL"
 }
 
 # serial or semi-parallel operation based on $RUNTIME_CONFIG file.
@@ -463,8 +497,8 @@ op_gtm(){
     log "Operate on gtm: $op $role $host $condition"
     get_node_status $host $PORT_GTM
     local stat_of_host=$VARS
-    if [[ $stat_of_host -eq $STATUS_HOSTDOWN ]] || [[ $stat_of_host -eq $STATUS_ERROR ]]; then
-        log "WARNING: can not $op on $name($host). Host is down"
+    if [[ $stat_of_host -eq $STATUS_UNREACHABLE ]]; then
+        log "WARNING: can not $op on $name($host). Host is unreachable"
         return 1
     elif [[ $stat_of_host -eq $STATUS_RUNNING ]]; then
         if [[ " init rebuild " =~ " $op " ]]; then
@@ -583,8 +617,8 @@ op_gtm_proxy(){
     log "Operate on gtm proxy: $op $name $host $condition"
     get_node_status "$host" $PORT_GTM_PXY
     local stat_of_host=$VARS
-    if [[ $stat_of_host -eq $STATUS_HOSTDOWN ]] || [[ $stat_of_host -eq $STATUS_ERROR ]]; then
-        log "WARNING: can not $op on $name($host). Host is down"
+    if [[ $stat_of_host -eq $STATUS_UNREACHABLE ]]; then
+        log "WARNING: can not $op on $name($host). Host is unreachable"
     elif [[ $stat_of_host -eq $STATUS_RUNNING ]]; then
         if [[ " init rebuild " =~ " $op " ]]; then
             log "WARNING: $op $name $role $host failed. Server is running. Try to stop it before. $0 -m stop -z gtm_proxy -n $name"
@@ -691,8 +725,8 @@ op_coordinator(){
     log "Operate on coordinator: $op $name $host $condition"
     get_node_status "$host" $PORT_COORD
     local stat_of_host=$VARS
-    if [[ $stat_of_host -eq $STATUS_HOSTDOWN ]] || [[ $stat_of_host -eq $STATUS_ERROR ]]; then
-        log "WARNING: can not $op on $name($host). Host is down"
+    if [[ $stat_of_host -eq $STATUS_UNREACHABLE ]]; then
+        log "WARNING: can not $op on $name($host). Host is unreachable"
     elif [[ $stat_of_host -eq $STATUS_RUNNING ]]; then
         if [[ " init copy " =~ " $op " ]]; then
             log "WARNING: $op $name $role $host failed. Server is running. Try to stop it before. $0 -m stop -z coordinator -n $name"
@@ -728,6 +762,8 @@ op_coordinator(){
         coordinator_sync_config "$name" "$host"
     elif [ "$op" == "reconfig" ]; then 
         coordinator_reconfig "$host"
+    elif [ "$op" == "analyze" ]; then 
+        coordinator_analyze "$host" 
     elif [ "$op" == "xsql" ]; then 
         coordinator_xsql "$host" "$condition"
     elif [ "$op" == "exec" ]; then 
@@ -816,6 +852,12 @@ coordinator_reconfig(){
     run_cmd_on $1 "psql -p $PORT_COORD -c \"SELECT pg_reload_conf();\" 2>&1;"
 }
 
+coordinator_analyze(){
+    local host=$1
+    scp $CTL_RUN_DIR/$ANALYZE_SQL $host:
+    run_cmd_on $host "psql -p $PORT_COORD -f $ANALYZE_SQL 1>/dev/null 2>&1;"
+}
+
 coordinator_xsql(){
     run_cmd_on $1 "psql -p $PORT_COORD -c \"$2\" 2>&1;"
 }
@@ -868,8 +910,8 @@ op_datanode(){
     log "Operate on datanode: $op $name $role $host $condition"
     get_node_status "$host" $PORT_DN
     local stat_of_host=$VARS
-    if [[ $stat_of_host -eq $STATUS_HOSTDOWN ]] || [[ $stat_of_host -eq $STATUS_ERROR ]]; then
-        log "WARNING: can not $op on $name($host). Host is down"
+    if [[ $stat_of_host -eq $STATUS_UNREACHABLE ]]; then
+        log "WARNING: can not $op on $name($host). Host is unreachable"
     elif [[ $stat_of_host -eq $STATUS_RUNNING ]]; then
         if [[ " init rebuild copy " =~ " $op " ]]; then
             log "WARNING: $op $name $role $host failed. Server is running. Try to stop it before. $0 -m stop -z datanode -n $name -r $role"
@@ -914,7 +956,7 @@ op_datanode(){
     elif [ "$op" == "copy" ] && [ "$role" == "master" ]; then 
         datanode_copy "$name" "$host" "$condition"
     elif [ "$op" == "basebackup" ] && [ "$role" == "backup" ]; then 
-        datanode_basebackup "$host" "$host_m" "$condition"
+        datanode_basebackup "$name" "$host" "$host_m" "$host_s" "$condition"
     elif [ "$op" == "syncconfig" ] && [ "$role" != "backup" ]; then 
         datanode_sync_config "$name" "$role"
     elif [ "$op" == "reconfig" ] && [ "$role" == "master" ]; then 
@@ -943,7 +985,8 @@ datanode_init(){
         if [ "$role" == "master" ]; then
             run_cmd_on $host "initdb --nodename $name -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME;"
         elif [ "$role" == "standby" ]; then
-            run_cmd_on $host "pg_basebackup -p $PORT_DN -h ${RT_DATANODE_MASTER_HOSTS[$name]} -c fast -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME;"
+            # "pg_basebackup ... -c fast" cost too much disk io.
+            run_cmd_on $host "pg_basebackup -p $PORT_DN -h ${RT_DATANODE_MASTER_HOSTS[$name]} -D $PGXL_DATA_HOME/$DATANODE_DIR_NAME;"
         fi
         datanode_sync_config "$name" "$role"
     fi
@@ -1036,6 +1079,7 @@ datanode_init_backup(){
 }
 
 datanode_start_stop_restart_status_reload(){
+    # TODO check recovery.conf if start or restart standy node
     local op=$1
     local host=$2
     run_cmd_on $host "
@@ -1092,8 +1136,8 @@ datanode_cleanpx(){
     fi
     local dt=`date -d "${second_ago} second ago" +"%Y-%m-%d %H:%M:%S"`
     local shell_cmds=""
-    local dbs=(`ssh $host "psql -p $PORT_DN -t -c \"select datname from pg_database;\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`)
-    for dbname in ${dbs[*]}; do
+    load_databases $host $PORT_DN
+    for dbname in ${RT_DBS[*]}; do
         shell_cmds=${shell_cmds}"
             psql -p $PORT_DN -t -c \"SELECT 'ROLLBACK PREPARED '''||gid||''';' FROM pg_prepared_xacts WHERE database = '$dbname' AND prepared < '$dt';\" > ${dbname}.$ROLLBACK_SQL 2>/dev/null;
             psql -p $PORT_DN -d $dbname -f ${dbname}.$ROLLBACK_SQL;
@@ -1140,9 +1184,11 @@ datanode_copy(){
 }
 
 datanode_basebackup(){
-    local host=$1
-    local host_m=$2
-    local kept_count=$3
+    local name=$1
+    local host=$2
+    local host_m=$3
+    local host_s=$4
+    local kept_count=$5
     if [ -z $kept_count ]; then
         kept_count=3
         log "Clean pg_basebackup on $host using default 3 kept"
@@ -1150,9 +1196,9 @@ datanode_basebackup(){
     local dir_datetime="$(date '+%Y%m%d-%H%M%S')"
     # "pg_basebackup ... -c fast" cost too much disk io.
     run_cmd_on $host "
-        mkdir -p $PGXL_BACKUP_HOME/$NAME/${dir_datetime};
-        pg_basebackup -p $PORT_DN -h $host_m -D $PGXL_BACKUP_HOME/$NAME/${dir_datetime} || exit;
-        ls -d $PGXL_BACKUP_HOME/$NAME/* -1 |sort -r -n |tail -n +${kept_count} |xargs rm -rf;
+        mkdir -p $PGXL_BACKUP_HOME/$name/${dir_datetime};
+        pg_basebackup -p $PORT_DN -h $host_m -D $PGXL_BACKUP_HOME/$name/${dir_datetime} || pg_basebackup -p $PORT_DN -h $host_s -D $PGXL_BACKUP_HOME/$name/${dir_datetime} || exit;
+        ls -d $PGXL_BACKUP_HOME/$name/* -1 |sort -r -n |tail -n +${kept_count} |xargs rm -rf;
     "
 }
 
@@ -1160,13 +1206,13 @@ datanode_basebackup(){
 failover_gtm(){
     get_node_status "$RT_GTM_STANDBY_HOST" $PORT_GTM
     local stat_of_standby=$VARS
-    if [[ $stat_of_standby -eq $STATUS_HOSTDOWN ]] || [[ $stat_of_standby -eq $STATUS_ERROR ]]; then
-        log "ERROR: Can not perform failover on gtm. Status of standby is HOSTDOWN or ERROR"
+    if [[ $stat_of_standby -eq $STATUS_UNREACHABLE ]]; then
+        log "ERROR: Can not perform failover on gtm. Host standby is unreachable"
         exit 1
     fi
     
     log ">>>>>> Perform failover on gtm to $RT_GTM_STANDBY_HOST"
-        
+    
     do_runtime_operate -o shutdown -m coordinator
     
     local tmp_host=$RT_GTM_MASTER_HOST
@@ -1229,9 +1275,7 @@ failover_datanode(){
     set_rt_conf "RT_DATANODE_MASTER_HOSTS[$name]=$new_master"
     set_rt_conf "RT_DATANODE_STANDBY_HOSTS[$name]=$new_standby"
     
-    prepare_register_sql
-    do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    register_nodes
     
     log "Fail over datanode $name done"
 }
@@ -1249,26 +1293,34 @@ add_coordinator(){
     local name=$1
     local condition=$2
     [ -z $name ] && return 1
-    add_node_info_to_rt_conf coordinator $name
-    do_runtime_operate -o copy -m coordinator -n $name -c "$condition"
-    do_runtime_operate -o start -m coordinator -n $name
-    prepare_register_sql
-    do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    is_cluster_locked_for_ddl
+    local resp=$VARS
+    if [[ "$resp" -eq $TRUE ]]; then
+        add_node_info_to_rt_conf coordinator $name
+        do_runtime_operate -o copy -m coordinator -n $name -c "$condition"
+        do_runtime_operate -o start -m coordinator -n $name
+        register_nodes
+    else
+        log "WARNING: need lock the cluster before add node. Open a psql client and execute \"select pgxc_lock_for_backup();\""
+    fi
 }
 
 add_datanode(){
     local name=$1
     local condition=$2
     [ -z $name ] && return 1
-    add_node_info_to_rt_conf datanode "$name"
-    do_runtime_operate -o copy -m datanode -n $name -c "$condition"
-    do_runtime_operate -o start -m datanode -n $name -r master
-    do_runtime_operate -o rebuild -m datanode -n $name -r standby
-    do_runtime_operate -o start -m datanode -n $name -r standby
-    prepare_register_sql
-    do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    is_cluster_locked_for_ddl
+    local resp=$VARS
+    if [[ "$resp" -eq $TRUE ]]; then
+        add_node_info_to_rt_conf datanode "$name"
+        do_runtime_operate -o copy -m datanode -n $name -c "$condition"
+        do_runtime_operate -o start -m datanode -n $name -r master
+        do_runtime_operate -o rebuild -m datanode -n $name -r standby
+        do_runtime_operate -o start -m datanode -n $name -r standby
+        register_nodes
+    else
+        log "WARNING: need lock the cluster before add node. Open a psql client and execute \"select pgxc_lock_for_backup();\""
+    fi
 }
 
 remove_gtm_proxy(){
@@ -1283,9 +1335,7 @@ remove_coordinator(){
     local name=$1
     [ -z $name ] && return 1
     do_runtime_operate -o shutdown -m coordinator -n $name
-    prepare_register_sql delete $name
-    do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    register_nodes delete $name
     set_rt_conf "RT_COORDINATOR_NAMES=(${RT_COORDINATOR_NAMES[@]/$name/})"
     set_rt_conf "RT_COORDINATOR_HOSTS[$name]="
 }
@@ -1297,9 +1347,7 @@ remove_datanode(){
     local resp=$VARS
     if [[ "$resp" -eq $TRUE ]]; then
         do_runtime_operate -o shutdown -m datanode -n $name
-        prepare_register_sql delete $name
-        do_runtime_operate -o register -m datanode -r master -s
-        do_runtime_operate -o register -m coordinator -s
+        register_nodes delete $name
         set_rt_conf "RT_DATANODE_NAMES=(${RT_DATANODE_NAMES[@]/$name/})"
         set_rt_conf "RT_DATANODE_MASTER_HOSTS[$name]="
         set_rt_conf "RT_DATANODE_STANDBY_HOSTS[$name]="
@@ -1307,6 +1355,14 @@ remove_datanode(){
     else
         log "ERROR: Cannot remove datanode $name. Please re-balance data first."
     fi
+}
+
+register_nodes(){
+    local op=$1
+    local name=$2
+    [ -z $op ] && prepare_register_sql || prepare_register_sql delete $name
+    do_runtime_operate -o register -m datanode -r master -s
+    do_runtime_operate -o register -m coordinator -s
 }
 
 # It costs a long time and locks table.
@@ -1321,7 +1377,7 @@ rebalance_datanode(){
     run_cmd_on $host "psql -p $PORT_COORD -f $REBALANCE_SQL 1>/dev/null 2>&1;"
 }
 
-vacuum_freeze(){
+vacuum_freeze_dbs(){
     search_an_active_host "${RT_COORDINATOR_HOSTS[*]}" $PORT_COORD
     local host=$VARS
     run_cmd_on $host "psql -p $PORT_COORD -c \"SELECT age(datfrozenxid), datfrozenxid, oid, datname FROM pg_database;\";"
@@ -1330,8 +1386,8 @@ vacuum_freeze(){
     for nodename in ${RT_DATANODE_NAMES[*]}; do
         echo "EXECUTE DIRECT ON ($nodename) 'update pg_database set datallowconn=''t'' where datname=''template0''';" >> $CTL_RUN_DIR/$VACUUM_FREEZE_SQL
     done
-    local dbs=(`ssh $host "psql -p $PORT_COORD -t -c \"select datname from pg_database;\" 2>/dev/null |tr -s '\n' |sed 's/^[ \t]*//g'"`)
-    for dbname in ${dbs[*]}; do
+    load_databases $host $PORT_COORD
+    for dbname in ${RT_DBS[*]}; do
         echo "\c $dbname" >> $CTL_RUN_DIR/$VACUUM_FREEZE_SQL
         echo "VACUUM FREEZE;" >> $CTL_RUN_DIR/$VACUUM_FREEZE_SQL
     done
@@ -1342,6 +1398,20 @@ vacuum_freeze(){
     run_cmd_on $host "psql -p $PORT_COORD -f $VACUUM_FREEZE_SQL;"
     do_runtime_operate -o xsql -m coordinator -c "update pg_database set datallowconn='f' where datname='template0';"
     run_cmd_on $host "psql -p $PORT_COORD -c \"SELECT age(datfrozenxid), datfrozenxid, oid, datname FROM pg_database;\";"
+}
+
+analyze_dbs(){
+    local mode=$1
+    local name=$2
+    search_an_active_host "${RT_COORDINATOR_HOSTS[*]}" $PORT_COORD
+    local host=$VARS
+    prepare_analyze_sql "$mode" "$host"
+    if [ -z $mode ] || [ "$mode" == "all" ]; then 
+        scp $CTL_RUN_DIR/$ANALYZE_SQL $host:
+        run_cmd_on $host "psql -p $PORT_COORD -f $ANALYZE_SQL;"
+    elif [ "$MODE" == "coordinator" ]; then 
+        do_runtime_operate -o analyze -m coordinator -n "$name"
+    fi
 }
 
 start_keeper(){
@@ -1385,7 +1455,7 @@ start_keeper(){
                 do_runtime_operate -o cleanpx -m datanode -r master -c 5
                 continue
             fi
-        elif [ -z $no_fo ] && [[ $s_master -eq $STATUS_HOSTDOWN ]] && [[ $s_standby -eq $STATUS_RUNNING ]]; then
+        elif [ -z $no_fo ] && [[ $s_master -eq $STATUS_UNREACHABLE ]] && [[ $s_standby -eq $STATUS_RUNNING ]]; then
             need_cleanpx=1
             failover_gtm
             continue
@@ -1436,7 +1506,7 @@ start_keeper(){
                     failover_datanode "$name"
                     continue 2
                 fi
-            elif [ -z $no_fo ] && [[ $s_master -eq $STATUS_HOSTDOWN ]] && [[ $s_standby -eq $STATUS_RUNNING ]]; then
+            elif [ -z $no_fo ] && [[ $s_master -eq $STATUS_UNREACHABLE ]] && [[ $s_standby -eq $STATUS_RUNNING ]]; then
                 need_cleanpx=1
                 failover_datanode "$name"
                 continue 2
@@ -1534,9 +1604,7 @@ pgxl_init(){
             # need to start master and standby before register nodes if synchronous_standby_names is not empty
             do_runtime_operate -o start -m datanode -r standby
             
-            prepare_register_sql
-            do_runtime_operate -o register -m datanode -r master -s
-            do_runtime_operate -o register -m coordinator -s
+            register_nodes
             
             local scripts=`ls $CTL_SQL_DIR/`
             search_an_active_host "${RT_COORDINATOR_HOSTS[*]}" $PORT_COORD
@@ -1654,19 +1722,22 @@ pgxl_failover(){
 
 pgxl_register(){
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
-    prepare_register_sql
-    do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    register_nodes
 }
 
 pgxl_rebalance(){
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
-    rebalance_datanode "$CONDITION" "$NAME"
+    rebalance_datanode "$NAME" "$CONDITION"
 }
 
 pgxl_freeze(){
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
-    vacuum_freeze
+    vacuum_freeze_dbs
+}
+
+pgxl_analyze(){
+    load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
+    analyze_dbs "$MODE" "$NAME"
 }
 
 pgxl_topology(){
@@ -1717,46 +1788,46 @@ pgxl_usage(){
                 ./pgxl_ctl.sh -m init -z gtm_proxy
                 ./pgxl_ctl.sh -m init -z coordinator -c backup
                 ./pgxl_ctl.sh -m init -z datanode -n datanode1 -r standby
-            <3> Sync *.conf file to nodes. 
-                ./pgxl_ctl.sh -m syncconfig -z all
-                ./pgxl_ctl.sh -m syncconfig -z datanode
-                ./pgxl_ctl.sh -m syncconfig -z coordinator
-            <4> Some operate on nodes. shutdown is if stop timeout then kill. 
+            <3> Add new node configured in pgxl_init.conf to a running cluster. Before do this, choose an active coordinator and issue pgxc_lock_for_backup() to block DDL issued to all the active coordinators. After, issue quit to release DDL lock.
+                ./pgxl_ctl.sh -m add -z coordinator -n coord5 -c clean
+                ./pgxl_ctl.sh -m add -z datanode -n datanode3 -c backup
+                ./pgxl_ctl.sh -m add -z gtm_proxy -n gtm_pxy3 -c clean
+            <4> Remove node from a running cluster.
+                ./pgxl_ctl.sh -m remove -z coordinator -n coord5
+                ./pgxl_ctl.sh -m remove -z datanode -n datanode3
+                ./pgxl_ctl.sh -m remove -z gtm_proxy -n gtm_pxy3
+            <5> Re-balance data. It will lock table.
+                ./pgxl_ctl.sh -m rebalance -n datanode5 -c add
+                ./pgxl_ctl.sh -m rebalance -n datanode5 -c delete
+            <6> Failover master node if it broke down.
+                ./pgxl_ctl.sh -m failover -z gtm
+                ./pgxl_ctl.sh -m failover -z datanode -n datanode3
+            <7> Rebuild standby node or gtm proxy if it broke down. 
+                ./pgxl_ctl.sh -m rebuild -z gtm -r standby -c clean
+                ./pgxl_ctl.sh -m rebuild -z gtm_proxy -c clean
+                ./pgxl_ctl.sh -m rebuild -z datanode -n datanode2 -r standby -c backup
+            <8> Some operate on nodes. shutdown is if stop timeout then kill. 
                 ./pgxl_ctl.sh -m start -z all
                 ./pgxl_ctl.sh -m stop -z gtm -r master
                 ./pgxl_ctl.sh -m kill -z gtm_proxy -n gtm_pxy1
                 ./pgxl_ctl.sh -m shutdown -z datanode -r standby
                 ./pgxl_ctl.sh -m restart -z datanode -n datanode1 -r master
                 ./pgxl_ctl.sh -m status -z coordinator
-            <5> Rebuild standby node or gtm proxy if it broke down. 
-                ./pgxl_ctl.sh -m rebuild -z gtm -r standby -c clean
-                ./pgxl_ctl.sh -m rebuild -z gtm_proxy -c clean
-                ./pgxl_ctl.sh -m rebuild -z datanode -n datanode2 -r standby -c backup
-            <6> Failover master node if it broke down.
-                ./pgxl_ctl.sh -m failover -z gtm
-                ./pgxl_ctl.sh -m failover -z datanode -n datanode3
-            <7> Add new node configured in pgxl_init.conf to a running cluster. Before do this, choose an active coordinator and issue pgxc_lock_for_backup() to block DDL issued to all the active coordinators. After, issue quit to release DDL lock.
-                ./pgxl_ctl.sh -m add -z coordinator -n coord5 -c clean
-                ./pgxl_ctl.sh -m add -z datanode -n datanode3 -c backup
-                ./pgxl_ctl.sh -m add -z gtm_proxy -n gtm_pxy3 -c clean
-            <8> Remove node from a running cluster.
-                ./pgxl_ctl.sh -m remove -z coordinator -n coord5
-                ./pgxl_ctl.sh -m remove -z datanode -n datanode3
-                ./pgxl_ctl.sh -m remove -z gtm_proxy -n gtm_pxy3
-            <9> Register all nodes according to pgxl_runtime.conf.
-                ./pgxl_ctl.sh -m register -z all
-           <10> Re-balance data. It will lock table.
-                ./pgxl_ctl.sh -m rebalance -n datanode5 -c add
-                ./pgxl_ctl.sh -m rebalance -n datanode5 -c delete
-           <11> Show cluster status
-                ./pgxl_ctl.sh -m topology
-           <12> Execute sql on datanodes or coordinators
-                ./pgxl_ctl.sh -m xsql -z coordinator -c \"CREATE EXTENSION pg_stat_statements;CREATE EXTENSION plpythonu;\"
-           <13> Execute bash shell on nodes
-                ./pgxl_ctl.sh -m exec -z gtm -r master -c \"uptime\"
-           <14> Reconfig or Reload postgresql.conf on datanode or coordinator
+            <9> Sync *.conf file to nodes. 
+                ./pgxl_ctl.sh -m syncconfig -z all
+                ./pgxl_ctl.sh -m syncconfig -z datanode
+                ./pgxl_ctl.sh -m syncconfig -z coordinator
+           <10> Reconfig or Reload postgresql.conf on datanode or coordinator
                 ./pgxl_ctl.sh -m reconfig -z datanode
                 ./pgxl_ctl.sh -m reload -z coordinator
+           <11> Register all nodes according to pgxl_runtime.conf.
+                ./pgxl_ctl.sh -m register -z all
+           <12> Show cluster status
+                ./pgxl_ctl.sh -m topology
+           <13> Execute sql on datanodes or coordinators
+                ./pgxl_ctl.sh -m xsql -z coordinator -c \"CREATE EXTENSION pg_stat_statements;CREATE EXTENSION plpythonu;\"
+           <14> Execute bash shell on nodes
+                ./pgxl_ctl.sh -m exec -z gtm -r master -c \"uptime\"
            <15> Clean log N days ago.
                 ./pgxl_ctl.sh -m cleanlog -z coordinator -c 30
                 ./pgxl_ctl.sh -m cleanlog -z datanode -c 7
@@ -1768,11 +1839,14 @@ pgxl_usage(){
                 ./pgxl_ctl.sh -m basebackup -z datanode -r backup -c 7
            <19> Execute vacuum freeze on all databases.
                 ./pgxl_ctl.sh -m freeze
-           <20> HA keeper
+           <20> Execute analyze on all or coordinator only.
+                ./pgxl_ctl.sh -m analyze -z all
+                ./pgxl_ctl.sh -m analyze -z coordinator -n coord5
+           <21> HA keeper
                 ./pgxl_ctl.sh -m start -z keeper
                 ./pgxl_ctl.sh -m start -z keeper -c no_failover
                 ./pgxl_ctl.sh -m stop -z keeper
-           <21> Crontab
+           <22> Crontab
                 */1 * * * * flock -n /tmp/pgxl_keeper.lock -c '/bin/bash /home/postgres/pgxl_ctl/pgxl_ctl.sh -m start -z keeper'
                 0 0 * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m cleanlog -z all -c 15
                 */5 * * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m cleanachlog -z datanode -r backup -c 3072
@@ -1780,6 +1854,15 @@ pgxl_usage(){
                 0 19 * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m freeze
     "
 }
+
+if [[ " init add remove start stop restart rebuild reconnect shutdown kill failover " =~ " $METHOD " ]]; then
+    if [ "`ps -ef |grep \"$0\" |grep start |grep keeper |wc -l`" != "0" ]; then
+        if [ "$MODE" != "keeper" ]; then
+            log "WARNING: HA keeper is running. Please stop it before."
+            exit 1
+        fi
+    fi
+fi
 
 case "$METHOD" in
     init)                                          pgxl_init
@@ -1794,23 +1877,25 @@ case "$METHOD" in
                                                    ;;
     restart)                                       pgxl_restart
                                                    ;;
-    status | rebuild | exec | reconnect)           pgxl_op_asc
+    status | xsql | exec | reconnect)              pgxl_op_asc
                                                    ;;
-    reload | reconfig | basebackup | xsql)         pgxl_op_asc
+    syncconfig | reload | reconfig | basebackup)   pgxl_op_asc
                                                    ;;
-    cleanachlog | cleanlog | cleanpx | syncconfig) pgxl_op_asc
+    cleanachlog | cleanlog | cleanpx | rebuild)    pgxl_op_asc
                                                    ;;
     shutdown | kill)                               pgxl_op_desc
                                                    ;;
     failover)                                      pgxl_failover
                                                    ;;
-    register)                                      pgxl_register
+    register | reg)                                pgxl_register
                                                    ;;
-    rebalance)                                     pgxl_rebalance
+    rebalance | rbl)                               pgxl_rebalance
                                                    ;;
-    topology)                                      pgxl_topology
+    topology | tplg)                               pgxl_topology
                                                    ;;
     freeze)                                        pgxl_freeze
+                                                   ;;
+    analyze | analyse)                             pgxl_analyze
                                                    ;;
     *)                                             pgxl_usage
                                                    ;;
