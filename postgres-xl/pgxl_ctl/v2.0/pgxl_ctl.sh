@@ -1275,7 +1275,13 @@ failover_datanode(){
     set_rt_conf "RT_DATANODE_MASTER_HOSTS[$name]=$new_master"
     set_rt_conf "RT_DATANODE_STANDBY_HOSTS[$name]=$new_standby"
     
-    register_nodes
+    local try_count=3
+    while [[ $try_count -gt 0 ]]
+    do
+        try_count=`expr ${try_count} - 1`
+        local rs=`ssh $new_master "pg_isready --port $PORT_DN -t 1" | grep accepting |wc -l`
+        [ "$rs" == "1" ] && register_nodes && break || sleep 3s
+    done
     
     log "Fail over datanode $name done"
 }
@@ -1300,6 +1306,7 @@ add_coordinator(){
         do_runtime_operate -o copy -m coordinator -n $name -c "$condition"
         do_runtime_operate -o start -m coordinator -n $name
         register_nodes
+        analyze_dbs coordinator "$name"
     else
         log "WARNING: need lock the cluster before add node. Open a psql client and execute \"select pgxc_lock_for_backup();\""
     fi
@@ -1362,7 +1369,7 @@ register_nodes(){
     local name=$2
     [ -z $op ] && prepare_register_sql || prepare_register_sql delete $name
     do_runtime_operate -o register -m datanode -r master -s
-    do_runtime_operate -o register -m coordinator -s
+    do_runtime_operate -o register -m coordinator
 }
 
 # It costs a long time and locks table.
