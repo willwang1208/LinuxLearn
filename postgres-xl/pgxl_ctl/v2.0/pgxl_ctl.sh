@@ -1421,6 +1421,13 @@ analyze_dbs(){
     fi
 }
 
+create_barrier(){
+    local tag=$1
+    search_an_active_host "${RT_COORDINATOR_HOSTS[*]}" $PORT_COORD
+    local host=$VARS
+    [ -z $tag ] && run_cmd_on $host "psql -p $PORT_COORD -c \"CREATE BARRIER;\";" || run_cmd_on $host "psql -p $PORT_COORD -c \"CREATE BARRIER '$tag';\";"
+}
+
 start_keeper(){
     # lock
     exec 7<> .pgxl_keeper.lock
@@ -1747,6 +1754,11 @@ pgxl_analyze(){
     analyze_dbs "$MODE" "$NAME"
 }
 
+pgxl_create_barrier(){
+    load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
+    create_barrier "$CONDITION"
+}
+
 pgxl_topology(){
     load_config "$CTL_RUN_DIR/$RUNTIME_CONFIG"
     echo -e "[GTM] gtm:master:$RT_GTM_MASTER_HOST:$(get_node_status_info $RT_GTM_MASTER_HOST $PORT_GTM)"
@@ -1781,11 +1793,11 @@ pgxl_usage(){
         Usage:
             ./pgxl_ctl.sh [OPTION]...
         Options:
-            -m        method (eg. init|add|remove|start|stop|kill|restart|reload|status|rebuild|failover|register|rebalance|topology)
-            -z        mode (eg. all|gtm|gtm_proxy|datanode|coordinator|keeper)
+            -m        method (init|add|remove|rebalance|failover|rebuild|start|stop|shutdown|kill|restart|status|syncconfig|reload|reconfig|register|xsql|topology|...)
+            -z        mode (all|gtm|gtm_proxy|datanode|coordinator|keeper)
             -n        name of node
-            -r        role (eg. master|standby)
-            -c        condition (eg. clean|backup)
+            -r        role (master|standby|backup)
+            -c        special condition
         Examples:
             <1> Initialize pgxl cluster configured in pgxl_init.conf. Include add all nodes information to ${RUNTIME_CONFIG}, initialize all nodes, register nodes and execute sql under ${CTL_SQL_DIR}.
                 ./pgxl_ctl.sh -m init -z all
@@ -1849,16 +1861,20 @@ pgxl_usage(){
            <20> Execute analyze on all or coordinator only.
                 ./pgxl_ctl.sh -m analyze -z all
                 ./pgxl_ctl.sh -m analyze -z coordinator -n coord5
-           <21> HA keeper
+           <21> Create barrier for recovery.
+                ./pgxl_ctl.sh -m barrier
+                ./pgxl_ctl.sh -m barrier -c $(date +'%Y%m%d-%H%M%S')
+           <22> HA keeper
                 ./pgxl_ctl.sh -m start -z keeper
                 ./pgxl_ctl.sh -m start -z keeper -c no_failover
                 ./pgxl_ctl.sh -m stop -z keeper
-           <22> Crontab
+           <23> Crontab
                 */1 * * * * flock -n /tmp/pgxl_keeper.lock -c '/bin/bash /home/postgres/pgxl_ctl/pgxl_ctl.sh -m start -z keeper'
                 0 0 * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m cleanlog -z all -c 15
                 */5 * * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m cleanachlog -z datanode -r backup -c 3072
                 15 */4 * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m basebackup -z datanode -r backup -c 10
                 0 19 * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m freeze
+                */1 * * * * /bin/bash /usr/local/pgxl_ctl/pgxl_ctl.sh -m barrier -c $(date +'%Y%m%d-%H%M%S')
     "
 }
 
@@ -1903,6 +1919,8 @@ case "$METHOD" in
     freeze)                                        pgxl_freeze
                                                    ;;
     analyze | analyse)                             pgxl_analyze
+                                                   ;;
+    barrier)                                       pgxl_create_barrier
                                                    ;;
     *)                                             pgxl_usage
                                                    ;;
